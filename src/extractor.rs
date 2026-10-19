@@ -118,6 +118,8 @@ pub struct ExtractionRecord {
     pub extractor_name: String,
     /// Whether any files inside `output_dir` have been modified since extraction.
     pub dirty: bool,
+    /// Unpadded byte length of the most recent repack operation for this entry, if repacked.
+    pub last_repacked_size: Option<usize>,
 }
 
 /// Manages lazy on-demand extraction into a temporary workspace and coordinates container repacking.
@@ -290,6 +292,7 @@ impl ExtractionManager {
                 success: true,
                 extractor_name: result.extractor,
                 dirty: false,
+                last_repacked_size: None,
             })
         } else {
             fs::create_dir_all(&output_dir)?;
@@ -315,6 +318,7 @@ impl ExtractionManager {
                 success: false,
                 extractor_name: utility_desc,
                 dirty: false,
+                last_repacked_size: None,
             })
         }
     }
@@ -384,6 +388,7 @@ impl ExtractionManager {
             .get_mut(&entry.index)
         {
             rec.dirty = false;
+            rec.last_repacked_size = Some(new_blob.len());
         }
 
         Ok(())

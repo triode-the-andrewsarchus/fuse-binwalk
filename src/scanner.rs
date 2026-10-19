@@ -124,6 +124,12 @@ pub struct ManifestEntry {
     pub end_hex: String,
     /// Total byte length of the region.
     pub size: usize,
+    /// Current unpadded payload size in bytes (`<= size`).
+    pub payload_size: usize,
+    /// Remaining free-space budget (`size - payload_size`) in bytes before exceeding the span.
+    pub slack_bytes: usize,
+    /// Whether this entry has been modified in the current session.
+    pub modified: bool,
     /// Virtual path under `/raw/`.
     pub raw_path: String,
     /// Virtual directory path under `/extracted/`, or [`None`] for carve-only entries.
@@ -640,6 +646,9 @@ pub fn build_manifest(binary_size: usize, entries: &[CarvedEntry]) -> ManifestDo
                 start_hex: format!("0x{:08X}", entry.span.start),
                 end_hex: format!("0x{:08X}", entry.span.end),
                 size: entry.span.len(),
+                payload_size: entry.span.len(),
+                slack_bytes: 0,
+                modified: false,
                 raw_path: format!("/raw/{}", entry.raw_filename),
                 extracted_path: if extractable {
                     Some(format!("/extracted/{}", entry.extracted_dirname))

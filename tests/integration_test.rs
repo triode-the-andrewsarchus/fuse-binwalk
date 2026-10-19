@@ -530,6 +530,39 @@ fn test_builtin_zip_repacker_and_truncate_workflow() {
         b"true"
     );
     assert_eq!(
+        fs.getxattr_node(svg_attr.ino, "user.binwalk.payload_size")
+            .unwrap(),
+        replacement.len().to_string().as_bytes()
+    );
+    assert_eq!(
+        fs.getxattr_node(svg_attr.ino, "user.binwalk.slack_bytes")
+            .unwrap(),
+        (svg_entry.span.len() - replacement.len())
+            .to_string()
+            .as_bytes()
+    );
+    assert_eq!(
+        fs.getxattr_node(svg_attr.ino, "user.binwalk.modified")
+            .unwrap(),
+        b"true"
+    );
+
+    // Verify `/manifest.json` reflects live `payload_size`, `slack_bytes`, and `modified`
+    let manifest_raw = fs.read_node(MANIFEST_INO, 0, 65536).unwrap();
+    let live_manifest: ManifestDocument = serde_json::from_slice(&manifest_raw).unwrap();
+    let live_svg_item = live_manifest
+        .entries
+        .iter()
+        .find(|e| e.index == svg_entry.index)
+        .unwrap();
+    assert!(live_svg_item.modified);
+    assert_eq!(live_svg_item.payload_size, replacement.len());
+    assert_eq!(
+        live_svg_item.slack_bytes,
+        svg_entry.span.len() - replacement.len()
+    );
+
+    assert_eq!(
         fs.getxattr_node(svg_attr.ino, "user.binwalk.nonexistent")
             .unwrap_err(),
         libc::ENODATA

@@ -128,6 +128,8 @@ pub struct BinwalkFs {
     /// Staging buffers for `/raw/<entry>` files that were truncated (`O_TRUNC` / `setattr(size)`)
     /// and are being rewritten prior to `flush`/`release`.
     raw_write_buffers: HashMap<usize, Vec<u8>>,
+    /// Tracks the active unpadded payload size (`<= span.len()`) for entries modified during the session.
+    modified_payload_sizes: HashMap<usize, usize>,
     /// When `true`, underflow replacements are rejected with `EINVAL` unless an explicit `pad_byte`
     /// is configured in [`WritePolicy`]. When `false` (default), smart signature padding is used.
     strict_size: bool,
@@ -162,6 +164,7 @@ impl BinwalkFs {
             inodes: HashMap::new(),
             host_path_to_ino: HashMap::new(),
             raw_write_buffers: HashMap::new(),
+            modified_payload_sizes: HashMap::new(),
             strict_size: false,
             next_ino: FIRST_DYNAMIC_INO,
             mount_time,
@@ -490,6 +493,32 @@ impl BinwalkFs {
         }
     }
 
+    /// Returns `(payload_size, slack_bytes, modified)` for `entry_idx`.
+    pub fn entry_budget_status(&self, entry_idx: usize) -> (usize, usize, bool) {
+        let span_len = self.entries[entry_idx].span.len();
+        if let Some(&payload_len) = self.modified_payload_sizes.get(&entry_idx) {
+            let clamped = payload_len.min(span_len);
+            (clamped, span_len.saturating_sub(clamped), true)
+        } else {
+            (span_len, 0, false)
+        }
+    }
+
+    /// Re-serializes `/manifest.json` so that `payload_size`, `slack_bytes`, and `modified` reflect live state.
+    fn refresh_manifest_bytes(&mut self) {
+        let mut doc = build_manifest(self.store.total_len(), &self.entries);
+        for item in &mut doc.entries {
+            let (payload_size, slack_bytes, modified) = self.entry_budget_status(item.index);
+            item.payload_size = payload_size;
+            item.slack_bytes = slack_bytes;
+            item.modified = modified;
+        }
+        if let Ok(mut bytes) = serde_json::to_vec_pretty(&doc) {
+            bytes.push(b'\n');
+            self.manifest_bytes = bytes;
+        }
+    }
+
     /// Invalidates overlapping `/extracted/` caches and updates parent ZIP CRC32 headers after a `/raw/` edit.
     fn on_raw_span_modified(&mut self, entry_idx: usize) {
         let span = self.entries[entry_idx].span;
@@ -500,6 +529,7 @@ impl BinwalkFs {
             self.clear_extracted_inodes_for_entry(inv_idx);
         }
         let _ = crate::repackers::sync_parent_zip_crc32_for_span(span, &self.entries, &*self.store);
+        self.refresh_manifest_bytes();
     }
 
     /// Replaces the entire span of a `/raw/<entry>` slice, applying smart padding (unless `strict_size`
@@ -519,6 +549,8 @@ impl BinwalkFs {
         self.store
             .replace_span_with_fallback_pad(span, new_bytes, fallback_pad)
             .map_err(|e| e.to_errno())?;
+        self.modified_payload_sizes
+            .insert(entry_idx, new_bytes.len());
         self.on_raw_span_modified(entry_idx);
         Ok(())
     }
@@ -560,12 +592,21 @@ impl BinwalkFs {
                 }
             })?;
 
+        if let Some(repacked_len) = self
+            .extractor
+            .get_cached(entry_idx)
+            .and_then(|r| r.last_repacked_size)
+        {
+            self.modified_payload_sizes.insert(entry_idx, repacked_len);
+        }
+
         let invalidated =
             self.extractor
                 .invalidate_overlapping(entry.span, &self.entries, Some(entry_idx));
         for inv_idx in invalidated {
             self.clear_extracted_inodes_for_entry(inv_idx);
         }
+        self.refresh_manifest_bytes();
         Ok(())
     }
 
@@ -912,6 +953,9 @@ impl BinwalkFs {
                         .store
                         .write_in_span(span, off_usize, data)
                         .map_err(|e| e.to_errno())?;
+                    self.modified_payload_sizes
+                        .entry(entry_idx)
+                        .or_insert_with(|| span.len());
                     self.on_raw_span_modified(entry_idx);
                     Ok(written)
                 }
@@ -1427,6 +1471,19 @@ impl BinwalkFs {
             if is_node_writable { "true" } else { "false" }
                 .as_bytes()
                 .to_vec(),
+        );
+        let (payload_size, slack_bytes, modified) = self.entry_budget_status(entry_idx);
+        attrs.insert(
+            "user.binwalk.payload_size".to_string(),
+            payload_size.to_string().into_bytes(),
+        );
+        attrs.insert(
+            "user.binwalk.slack_bytes".to_string(),
+            slack_bytes.to_string().into_bytes(),
+        );
+        attrs.insert(
+            "user.binwalk.modified".to_string(),
+            if modified { "true" } else { "false" }.as_bytes().to_vec(),
         );
         attrs.insert(
             "user.binwalk.has_extractor".to_string(),
