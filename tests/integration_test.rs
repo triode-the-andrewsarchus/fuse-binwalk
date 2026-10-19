@@ -513,4 +513,25 @@ fn test_builtin_zip_repacker_and_truncate_workflow() {
             u32::from_le_bytes(repacked_zip[lfh_rel + 14..lfh_rel + 18].try_into().unwrap());
         assert_eq!(actual_lfh_crc, expected_crc);
     }
+
+    // Verify extended attributes (`listxattr_node` / `getxattr_node`) on `/raw/` and `/extracted/`
+    let xattr_names = fs.listxattr_node(svg_attr.ino).unwrap();
+    assert!(xattr_names.contains(&"user.binwalk.name".to_string()));
+    assert!(xattr_names.contains(&"user.binwalk.description".to_string()));
+    assert!(xattr_names.contains(&"user.binwalk.offset".to_string()));
+    assert!(xattr_names.contains(&"user.binwalk.writable".to_string()));
+    assert_eq!(
+        fs.getxattr_node(svg_attr.ino, "user.binwalk.name").unwrap(),
+        b"svg"
+    );
+    assert_eq!(
+        fs.getxattr_node(svg_attr.ino, "user.binwalk.writable")
+            .unwrap(),
+        b"true"
+    );
+    assert_eq!(
+        fs.getxattr_node(svg_attr.ino, "user.binwalk.nonexistent")
+            .unwrap_err(),
+        libc::ENODATA
+    );
 }

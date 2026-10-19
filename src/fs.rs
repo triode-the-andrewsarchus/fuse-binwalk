@@ -10,7 +10,7 @@ use crate::storage::{smart_pad_byte, BinaryStore, WritePolicy};
 use filetime::FileTime;
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow, FUSE_ROOT_ID,
+    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, FUSE_ROOT_ID,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
@@ -1370,6 +1370,97 @@ impl BinwalkFs {
         self.extractor.mark_dirty(src_entry_idx);
         self.repack_and_sync_extracted(src_entry_idx)
     }
+
+    /// Collects all `user.binwalk.*` extended attributes for `ino`.
+    fn xattrs_for_node(&self, ino: u64) -> Result<BTreeMap<String, Vec<u8>>, libc::c_int> {
+        let Some(node) = self.inodes.get(&ino) else {
+            return Err(libc::ENOENT);
+        };
+
+        let (entry_idx, is_node_writable) = match &node.kind {
+            InodeKind::RawSlice { entry_idx } => (*entry_idx, self.is_writable()),
+            InodeKind::ExtractedEntryRoot { entry_idx }
+            | InodeKind::ExtractedHostNode { entry_idx, .. } => {
+                (*entry_idx, self.is_extracted_entry_writable(*entry_idx))
+            }
+            _ => return Ok(BTreeMap::new()),
+        };
+
+        let entry = &self.entries[entry_idx];
+        let confidence_str = match entry.signature_result.confidence {
+            0..=64 => "low",
+            65..=199 => "medium",
+            _ => "high",
+        };
+
+        let mut attrs = BTreeMap::new();
+        attrs.insert(
+            "user.binwalk.index".to_string(),
+            entry.index.to_string().into_bytes(),
+        );
+        attrs.insert(
+            "user.binwalk.name".to_string(),
+            entry.signature_result.name.as_bytes().to_vec(),
+        );
+        attrs.insert(
+            "user.binwalk.description".to_string(),
+            entry.signature_result.description.as_bytes().to_vec(),
+        );
+        attrs.insert(
+            "user.binwalk.offset".to_string(),
+            format!("0x{:08X}", entry.span.start).into_bytes(),
+        );
+        attrs.insert(
+            "user.binwalk.end_offset".to_string(),
+            format!("0x{:08X}", entry.span.end).into_bytes(),
+        );
+        attrs.insert(
+            "user.binwalk.span_size".to_string(),
+            entry.span.len().to_string().into_bytes(),
+        );
+        attrs.insert(
+            "user.binwalk.confidence".to_string(),
+            confidence_str.as_bytes().to_vec(),
+        );
+        attrs.insert(
+            "user.binwalk.writable".to_string(),
+            if is_node_writable { "true" } else { "false" }
+                .as_bytes()
+                .to_vec(),
+        );
+        attrs.insert(
+            "user.binwalk.has_extractor".to_string(),
+            if entry.has_extractor() {
+                "true"
+            } else {
+                "false"
+            }
+            .as_bytes()
+            .to_vec(),
+        );
+
+        Ok(attrs)
+    }
+
+    /// Lists all extended attribute names (`user.binwalk.*`) attached to `ino`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ENOENT` if `ino` does not exist.
+    pub fn listxattr_node(&self, ino: u64) -> Result<Vec<String>, libc::c_int> {
+        let attrs = self.xattrs_for_node(ino)?;
+        Ok(attrs.into_keys().collect())
+    }
+
+    /// Reads the raw value of the extended attribute `name` on `ino`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ENOENT` if `ino` does not exist, or `ENODATA` if `name` is not present on `ino`.
+    pub fn getxattr_node(&self, ino: u64, name: &str) -> Result<Vec<u8>, libc::c_int> {
+        let mut attrs = self.xattrs_for_node(ino)?;
+        attrs.remove(name).ok_or(libc::ENODATA)
+    }
 }
 
 fn metadata_to_filetype(md: &fs::Metadata) -> FileType {
@@ -1837,5 +1928,51 @@ impl Filesystem for BinwalkFs {
         let files = self.inodes.len() as u64;
         let _ = UNIX_EPOCH;
         reply.statfs(blocks, 0, 0, files, 0, BLOCK_SIZE, 255, BLOCK_SIZE);
+    }
+
+    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
+        match self.listxattr_node(ino) {
+            Ok(names) => {
+                let mut buf = Vec::new();
+                for name in names {
+                    buf.extend_from_slice(name.as_bytes());
+                    buf.push(0);
+                }
+                if size == 0 {
+                    reply.size(buf.len() as u32);
+                } else if buf.len() <= size as usize {
+                    reply.data(&buf);
+                } else {
+                    reply.error(libc::ERANGE);
+                }
+            }
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn getxattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        size: u32,
+        reply: ReplyXattr,
+    ) {
+        let Some(name_str) = name.to_str() else {
+            reply.error(libc::ENODATA);
+            return;
+        };
+        match self.getxattr_node(ino, name_str) {
+            Ok(val) => {
+                if size == 0 {
+                    reply.size(val.len() as u32);
+                } else if val.len() <= size as usize {
+                    reply.data(&val);
+                } else {
+                    reply.error(libc::ERANGE);
+                }
+            }
+            Err(errno) => reply.error(errno),
+        }
     }
 }
