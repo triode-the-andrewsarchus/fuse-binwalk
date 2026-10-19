@@ -1,0 +1,14 @@
+# Rust / Cargo build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Temporary and OS files
+*.swp
+*.swo
+*~
+.DS_Store
+
+# IDE / Editor directories
+.idea/
+.vscode/
