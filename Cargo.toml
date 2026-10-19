@@ -2,7 +2,14 @@
 name = "fuse-binwalk"
 version = "0.1.0"
 edition = "2021"
-description = "FUSE filesystem driver powered by Binwalk v3 for mounting arbitrary binaries"
+authors = ["Vega Carlson <vegac@protonmail.com>"]
+description = "Mount arbitrary binaries and firmware images as navigable, writable FUSE filesystems using Binwalk v3"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/triode-the-andrewsarchus/fuse-binwalk"
+homepage = "https://github.com/triode-the-andrewsarchus/fuse-binwalk"
+readme = "README.md"
+keywords = ["fuse", "binwalk", "firmware", "reverse-engineering", "filesystem"]
+categories = ["command-line-utilities", "filesystem", "parsing"]
 
 [dependencies]
 aho-corasick = "1.1"

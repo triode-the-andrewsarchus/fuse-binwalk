@@ -56,3 +56,13 @@ cargo run -- <BINARY_PATH> <MOUNTPOINT> --writable --cow
 - `--full-search`: Scan for short signatures throughout the entire file instead of only at offset 0
 - `-d, --daemon`: Run as a background daemon instead of staying in the foreground
 - `--allow-other`: Allow other system users to access the FUSE mount
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+
+at your option.
+
