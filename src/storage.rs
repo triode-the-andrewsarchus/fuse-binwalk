@@ -322,8 +322,72 @@ pub trait BinaryStore: Send + Sync {
     fn commit(&self) -> Result<(), StorageError>;
 }
 
-/// Thread-safe [`BinaryStore`] implementation supporting zero-overhead immutable reads,
-/// Copy-on-Write byte-range overlays, and bounded write-through.
+/// Read-only memory-mapped file region backed by `libc::mmap`.
+struct MmapBuffer {
+    ptr: *mut libc::c_void,
+    len: usize,
+}
+
+// SAFETY: The mapping is created with `PROT_READ` and `MAP_PRIVATE` and remains valid for `len`
+// bytes until `Drop` unmaps it.
+unsafe impl Send for MmapBuffer {}
+// SAFETY: Concurrent read access to a `PROT_READ` mapping is thread-safe.
+unsafe impl Sync for MmapBuffer {}
+
+impl MmapBuffer {
+    fn map_file(file: &std::fs::File, len: usize) -> std::io::Result<Self> {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: `file` is a valid open file descriptor, `len > 0`, and `MAP_PRIVATE` with
+        // `PROT_READ` maps the file into the process address space backed by the OS page cache.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { ptr, len })
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: `self.ptr` was returned by a successful `mmap` of `self.len` bytes.
+        unsafe { std::slice::from_raw_parts(self.ptr.cast::<u8>(), self.len) }
+    }
+}
+
+impl Drop for MmapBuffer {
+    fn drop(&mut self) {
+        if self.len > 0 && !self.ptr.is_null() && self.ptr != libc::MAP_FAILED {
+            // SAFETY: `self.ptr` and `self.len` come from a valid `libc::mmap` call.
+            unsafe {
+                let _ = libc::munmap(self.ptr, self.len);
+            }
+        }
+    }
+}
+
+enum BaseData {
+    Owned(Arc<Vec<u8>>),
+    Mmap(Arc<MmapBuffer>),
+}
+
+impl BaseData {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(vec) => vec.as_slice(),
+            Self::Mmap(mmap) => mmap.as_slice(),
+        }
+    }
+}
+
+/// Thread-safe [`BinaryStore`] implementation supporting memory-mapped (`mmap`) or in-memory
+/// immutable reads, Copy-on-Write byte-range overlays, and bounded write-through.
 ///
 /// # Examples
 ///
@@ -342,24 +406,35 @@ pub trait BinaryStore: Send + Sync {
 /// ```
 pub struct OverlayBinaryStore {
     backing_path: Option<PathBuf>,
-    base_data: Arc<Vec<u8>>,
+    base_data: BaseData,
     policy: WritePolicy,
     /// Chunked CoW overlay keyed by absolute starting byte offset.
     overlay: RwLock<BTreeMap<usize, Vec<u8>>>,
 }
 
 impl OverlayBinaryStore {
-    /// Loads a binary file from `path` into memory with the specified [`WritePolicy`].
+    /// Opens a binary file at `path` using a read-only memory map (`mmap`) with the specified [`WritePolicy`].
+    ///
+    /// Falls back to reading the file into a heap buffer if `path` is empty or does not support `mmap`.
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::Io`] if `path` cannot be read.
+    /// Returns [`StorageError::Io`] if `path` cannot be opened or read.
     pub fn from_file(path: impl AsRef<Path>, policy: WritePolicy) -> Result<Self, StorageError> {
         let path_buf = path.as_ref().to_path_buf();
-        let data = std::fs::read(&path_buf)?;
+        let file = std::fs::File::open(&path_buf)?;
+        let len = usize::try_from(file.metadata()?.len()).unwrap_or(0);
+        let base_data = if len > 0 {
+            match MmapBuffer::map_file(&file, len) {
+                Ok(mmap) => BaseData::Mmap(Arc::new(mmap)),
+                Err(_) => BaseData::Owned(Arc::new(std::fs::read(&path_buf)?)),
+            }
+        } else {
+            BaseData::Owned(Arc::new(Vec::new()))
+        };
         Ok(Self {
             backing_path: Some(path_buf),
-            base_data: Arc::new(data),
+            base_data,
             policy,
             overlay: RwLock::new(BTreeMap::new()),
         })
@@ -369,15 +444,20 @@ impl OverlayBinaryStore {
     pub fn from_bytes(data: Vec<u8>, backing_path: Option<PathBuf>, policy: WritePolicy) -> Self {
         Self {
             backing_path,
-            base_data: Arc::new(data),
+            base_data: BaseData::Owned(Arc::new(data)),
             policy,
             overlay: RwLock::new(BTreeMap::new()),
         }
     }
 
+    /// Returns `true` if the base binary image is backed by an OS memory map (`mmap`).
+    pub fn is_memory_mapped(&self) -> bool {
+        matches!(self.base_data, BaseData::Mmap(_))
+    }
+
     /// Returns a slice of the original unmodified base binary image.
     pub fn base_bytes(&self) -> &[u8] {
-        &self.base_data
+        self.base_data.as_slice()
     }
 
     fn apply_overlay_write(&self, abs_offset: usize, data: &[u8]) {
@@ -411,7 +491,7 @@ impl OverlayBinaryStore {
 
         let merged_start = first_key.min(write_start);
         let merged_end = last_end.max(write_end);
-        let mut merged = self.base_data[merged_start..merged_end].to_vec();
+        let mut merged = self.base_bytes()[merged_start..merged_end].to_vec();
 
         for key in overlapping_keys {
             if let Some(seg) = map.remove(&key) {
@@ -439,7 +519,7 @@ impl OverlayBinaryStore {
 
 impl BinaryStore for OverlayBinaryStore {
     fn total_len(&self) -> usize {
-        self.base_data.len()
+        self.base_bytes().len()
     }
 
     fn backing_path(&self) -> Option<&Path> {
@@ -451,14 +531,15 @@ impl BinaryStore for OverlayBinaryStore {
     }
 
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize, StorageError> {
-        let total = self.base_data.len();
+        let base = self.base_bytes();
+        let total = base.len();
         if offset >= total || buf.is_empty() {
             return Ok(0);
         }
         let read_len = (total - offset).min(buf.len());
         let read_end = offset + read_len;
 
-        buf[..read_len].copy_from_slice(&self.base_data[offset..read_end]);
+        buf[..read_len].copy_from_slice(&base[offset..read_end]);
 
         let map = self.overlay.read().expect("overlay lock poisoned");
         if !map.is_empty() {
@@ -650,5 +731,30 @@ mod tests {
         // Replacing span with shorter data pads with 0xFF
         store.replace_span(span, &[7, 8]).unwrap();
         assert_eq!(store.read_slice(span).unwrap(), vec![7, 8, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn test_mmap_file_backing_and_commit() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        tmp.flush().unwrap();
+
+        let store = OverlayBinaryStore::from_file(
+            tmp.path(),
+            WritePolicy::CopyOnWriteOverlay {
+                pad_byte: Some(0x00),
+            },
+        )
+        .unwrap();
+        assert!(store.is_memory_mapped());
+        assert_eq!(store.base_bytes(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+
+        let span = ByteSpan::new(2, 6).unwrap();
+        store.replace_span(span, &[99, 88]).unwrap();
+        assert_eq!(store.read_slice(span).unwrap(), vec![99, 88, 0, 0]);
+        store.commit().unwrap();
+
+        let on_disk = std::fs::read(tmp.path()).unwrap();
+        assert_eq!(on_disk, vec![1, 2, 99, 88, 0, 0, 7, 8]);
     }
 }
