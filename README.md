@@ -8,7 +8,11 @@ A Rust FUSE filesystem driver powered by [Binwalk v3](https://docs.rs/binwalk/la
 - **Top-Level Category Layout**:
   - `/raw/` — Carved byte slices (`0x<START>_0x<END>_<sig_name>.<ext>`) mapped directly from the binary's `[start..end]` byte range.
   - `/extracted/` — Directories (`0x<START>_0x<END>_<sig_name>/`) for container/compression signatures. Populated **lazily on-demand** upon first access, strictly bounded to `[start..end]`. If an extractor fails, an `_extraction_status.txt` diagnostic file is generated in the directory.
-  - `/manifest.json` — Structured JSON catalog of all discovered bounded regions, offsets, sizes, confidence levels, and virtual paths.
+  - `/manifest.json` — Live JSON catalog of all discovered bounded regions, offsets, sizes, active `payload_size`, remaining `slack_bytes` free-space budget, `modified` state, confidence levels, and virtual paths.
+- **Extended Attributes (`xattr`)**:
+  - Every `/raw/` slice and `/extracted/` node exposes `user.binwalk.*` extended attributes (`name`, `description`, `offset`, `end_offset`, `span_size`, `payload_size`, `slack_bytes`, `modified`, `confidence`, `writable`, `has_extractor`) queryable via `getfattr -d` or `attr`.
+- **Memory-Mapped (`mmap`) Backing Store**:
+  - Uses OS page-cache memory mapping (`mmap`) for the base binary image with a sparse Copy-on-Write overlay for modified spans, enabling fast startup and low memory overhead even on large images.
 - **Full Write & Repacking Support**:
   - **Persistence Modes**: Read-only by default; supports `-w/--writable` (in-place write-through), `-o/--output <PATH>` (clones the binary to `<PATH>` and writes changes there), and `--cow` (buffers modifications in a Copy-on-Write memory overlay until `fsync` or unmount).
   - **Smart Padding & Size Safety**: Rejects writes exceeding a span's original `[start..end]` size (`ENOSPC`) so subsequent offsets in the binary are never shifted. Automatically pads shorter replacements on file close or repack using smart format-aware padding (`0x20` ASCII space for text/SVG/XML/PEM, `0x00` for binary formats), overridable via `--pad-byte <BYTE>` or disabled via `--strict-size`.
@@ -19,6 +23,12 @@ A Rust FUSE filesystem driver powered by [Binwalk v3](https://docs.rs/binwalk/la
 ## Usage
 
 ```bash
+# List discovered bounded signatures and repacker support without mounting
+cargo run -- <BINARY_PATH> --list
+
+# Dump the JSON manifest to stdout without mounting
+cargo run -- <BINARY_PATH> --manifest
+
 # Mount read-only
 cargo run -- <BINARY_PATH> <MOUNTPOINT>
 
@@ -31,8 +41,10 @@ cargo run -- <BINARY_PATH> <MOUNTPOINT> --writable --cow
 
 ### CLI Options
 
-- `<BINARY_PATH>`: Path to the binary or firmware image to mount
-- `<MOUNTPOINT>`: Directory where the FUSE filesystem will be mounted
+- `<BINARY_PATH>`: Path to the binary or firmware image to analyze/mount
+- `[MOUNTPOINT]`: Directory where the FUSE filesystem will be mounted (optional with `--list` or `--manifest`)
+- `-l, --list`: List discovered bounded signatures and repacker support to stdout without mounting
+- `--manifest`: Print the JSON manifest to stdout and exit without mounting
 - `-w, --writable`: Enable write support (in-place write-through unless `--cow` is set)
 - `-o, --output <PATH>`: Clone the input binary to `<PATH>` before mounting and write modifications there
 - `--cow`: Buffer writes in a Copy-on-Write memory overlay until `fsync` or clean unmount

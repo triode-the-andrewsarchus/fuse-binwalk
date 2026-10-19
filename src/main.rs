@@ -1,10 +1,11 @@
 //! Command-line entry point for mounting binary images with `fuse-binwalk`.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
+use fuse_binwalk::repackers::register_builtin_repackers;
 use fuse_binwalk::{
-    scan_bounded_signatures, BinwalkFs, ConfidenceLevel, OverlayBinaryStore, ScanConfig,
-    WritePolicy,
+    build_manifest, scan_bounded_signatures, BinwalkFs, ConfidenceLevel, OverlayBinaryStore,
+    RepackerRegistry, ScanConfig, WritePolicy,
 };
 use fuser::MountOption;
 use log::info;
@@ -41,9 +42,17 @@ struct Cli {
     #[arg(value_name = "BINARY_PATH")]
     binary_path: PathBuf,
 
-    /// Directory where the FUSE filesystem should be mounted.
-    #[arg(value_name = "MOUNTPOINT")]
-    mountpoint: PathBuf,
+    /// Directory where the FUSE filesystem should be mounted (optional when `--list` or `--manifest` is used).
+    #[arg(value_name = "MOUNTPOINT", required_unless_present_any = ["list", "manifest"])]
+    mountpoint: Option<PathBuf>,
+
+    /// Lists discovered bounded signatures and repacker support to stdout without mounting.
+    #[arg(short = 'l', long = "list")]
+    list: bool,
+
+    /// Prints the JSON manifest to stdout and exits without mounting.
+    #[arg(long = "manifest")]
+    manifest: bool,
 
     /// Enables write support (in-place write-through to the target binary unless `--cow` is set).
     #[arg(short = 'w', long = "writable")]
@@ -103,37 +112,43 @@ fn main() -> Result<()> {
         )
     })?;
 
-    let target_binary_path = if let Some(out_path) = &cli.output {
-        if let Some(parent) = out_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).with_context(|| {
-                    format!("Failed to create output directory '{}'", parent.display())
-                })?;
+    let is_dry_run = cli.list || cli.manifest;
+
+    let target_binary_path = if !is_dry_run {
+        if let Some(out_path) = &cli.output {
+            if let Some(parent) = out_path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).with_context(|| {
+                        format!("Failed to create output directory '{}'", parent.display())
+                    })?;
+                }
             }
-        }
-        info!(
-            "Cloning '{}' -> '{}' for writable mounting",
-            source_binary_path.display(),
-            out_path.display()
-        );
-        std::fs::copy(&source_binary_path, out_path).with_context(|| {
-            format!(
-                "Failed to copy '{}' to '{}'",
+            info!(
+                "Cloning '{}' -> '{}' for writable mounting",
                 source_binary_path.display(),
                 out_path.display()
-            )
-        })?;
-        std::fs::canonicalize(out_path).map_err(|e| {
-            anyhow!(
-                "Failed to resolve output path '{}': {e}",
-                out_path.display()
-            )
-        })?
+            );
+            std::fs::copy(&source_binary_path, out_path).with_context(|| {
+                format!(
+                    "Failed to copy '{}' to '{}'",
+                    source_binary_path.display(),
+                    out_path.display()
+                )
+            })?;
+            std::fs::canonicalize(out_path).map_err(|e| {
+                anyhow!(
+                    "Failed to resolve output path '{}': {e}",
+                    out_path.display()
+                )
+            })?
+        } else {
+            source_binary_path
+        }
     } else {
         source_binary_path
     };
 
-    let is_writable = cli.writable || cli.output.is_some() || cli.cow;
+    let is_writable = !is_dry_run && (cli.writable || cli.output.is_some() || cli.cow);
     let write_policy = if !is_writable {
         WritePolicy::ReadOnly
     } else if cli.cow {
@@ -146,25 +161,6 @@ fn main() -> Result<()> {
             write_through: true,
         }
     };
-
-    // If the mountpoint has an active or stale FUSE mount from a previous run, unmount it cleanly first
-    let _ = std::process::Command::new("fusermount3")
-        .args(["-u", "-z"])
-        .arg(&cli.mountpoint)
-        .status()
-        .or_else(|_| {
-            std::process::Command::new("fusermount")
-                .args(["-u", "-z"])
-                .arg(&cli.mountpoint)
-                .status()
-        });
-
-    let mountpoint = std::fs::canonicalize(&cli.mountpoint).with_context(|| {
-        format!(
-            "Failed to resolve mountpoint '{}'",
-            cli.mountpoint.display()
-        )
-    })?;
 
     info!(
         "Loading binary '{}' (write_policy: {:?})",
@@ -195,6 +191,67 @@ fn main() -> Result<()> {
         entries.len(),
         extractable_count
     );
+
+    if cli.manifest {
+        let doc = build_manifest(store.base_bytes().len(), &entries);
+        println!("{}", serde_json::to_string_pretty(&doc)?);
+        return Ok(());
+    }
+
+    if cli.list {
+        let repackers = RepackerRegistry::new();
+        register_builtin_repackers(&repackers);
+        println!(
+            "{:<6} {:<23} {:>10} {:<16} {:<10} {:<10} DESCRIPTION",
+            "INDEX", "BYTE RANGE", "SIZE", "SIGNATURE", "EXTRACTED", "REPACKER"
+        );
+        println!("{}", "-".repeat(100));
+        for entry in &entries {
+            let has_ext = entry.has_extractor();
+            let has_repacker = has_ext && repackers.can_repack(&entry.signature_result.name);
+            println!(
+                "{:<6} 0x{:08X}..0x{:08X} {:>10} {:<16} {:<10} {:<10} {}",
+                entry.index,
+                entry.span.start,
+                entry.span.end,
+                entry.span.len(),
+                entry.signature_result.name,
+                if has_ext { "yes" } else { "no" },
+                if has_repacker { "writable" } else { "-" },
+                entry.signature_result.description
+            );
+        }
+        println!(
+            "\nTotal: {} bounded signature(s), {} extractable container/stream(s) in {} bytes.",
+            entries.len(),
+            extractable_count,
+            store.base_bytes().len()
+        );
+        return Ok(());
+    }
+
+    let Some(raw_mountpoint) = &cli.mountpoint else {
+        bail!("MOUNTPOINT is required unless --list or --manifest is specified");
+    };
+
+    // If the mountpoint has an active or stale FUSE mount from a previous run, unmount it cleanly first
+    let _ = std::process::Command::new("fusermount3")
+        .args(["-u", "-z"])
+        .arg(raw_mountpoint)
+        .status()
+        .or_else(|_| {
+            std::process::Command::new("fusermount")
+                .args(["-u", "-z"])
+                .arg(raw_mountpoint)
+                .status()
+        });
+
+    let mountpoint = std::fs::canonicalize(raw_mountpoint).with_context(|| {
+        format!(
+            "Failed to resolve mountpoint '{}'",
+            raw_mountpoint.display()
+        )
+    })?;
 
     if cli.daemon {
         info!("Daemonizing fuse-binwalk in background...");
