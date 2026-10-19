@@ -1,5 +1,5 @@
 use crate::scanner::CarvedEntry;
-use crate::storage::{BinaryStore, StorageError};
+use crate::storage::{smart_pad_byte, BinaryStore, ByteSpan, StorageError};
 use anyhow::{anyhow, Result};
 use binwalk::extractors::common::{self as bw_extractors, ExtractorType};
 use std::collections::HashMap;
@@ -14,11 +14,26 @@ pub trait RegionRepacker: Send + Sync {
     /// Signature name handled by this repacker (e.g., `"gzip"`, `"tar"`, `"squashfs"`).
     fn signature_name(&self) -> &str;
 
+    /// Returns whether this repacker is currently available on the host (e.g., external binary exists).
+    fn is_available(&self) -> bool {
+        true
+    }
+
     /// Repack the contents of `extracted_dir` into a new serialized byte buffer.
     fn repack(&self, extracted_dir: &Path, entry: &CarvedEntry) -> Result<Vec<u8>>;
+
+    /// Repack with access to the underlying `BinaryStore` (used by delta-aware repackers like `ZipRepacker`).
+    fn repack_with_store(
+        &self,
+        extracted_dir: &Path,
+        entry: &CarvedEntry,
+        _store: &dyn BinaryStore,
+    ) -> Result<Vec<u8>> {
+        self.repack(extracted_dir, entry)
+    }
 }
 
-/// Registry of `RegionRepacker` implementations for future write-back from `/extracted/`.
+/// Registry of `RegionRepacker` implementations for write-back from `/extracted/`.
 #[derive(Default)]
 pub struct RepackerRegistry {
     repackers: RwLock<HashMap<String, Arc<dyn RegionRepacker>>>,
@@ -44,6 +59,11 @@ impl RepackerRegistry {
             .expect("repackers lock poisoned")
             .get(signature_name)
             .cloned()
+            .filter(|r| r.is_available())
+    }
+
+    pub fn can_repack(&self, signature_name: &str) -> bool {
+        self.get(signature_name).is_some()
     }
 }
 
@@ -59,7 +79,7 @@ pub struct ExtractionRecord {
     pub dirty: bool,
 }
 
-/// Manages lazy on-demand extraction into a temporary workspace and supports future repacking.
+/// Manages lazy on-demand extraction into a temporary workspace and supports repacking.
 pub struct ExtractionManager {
     temp_dir: TempDir,
     records: Mutex<HashMap<usize, ExtractionRecord>>,
@@ -71,10 +91,12 @@ impl ExtractionManager {
         let temp_dir = tempfile::Builder::new()
             .prefix("fuse-binwalk-")
             .tempdir()?;
+        let repackers = RepackerRegistry::new();
+        crate::repackers::register_builtin_repackers(&repackers);
         Ok(Self {
             temp_dir,
             records: Mutex::new(HashMap::new()),
-            repackers: RepackerRegistry::new(),
+            repackers,
         })
     }
 
@@ -101,6 +123,30 @@ impl ExtractionManager {
         {
             rec.dirty = true;
         }
+    }
+
+    /// Invalidates cached extractions whose spans overlap `modified_span` (excluding `except_entry_idx`).
+    /// Returns the list of invalidated `entry_index` values so the filesystem can refresh its inode cache.
+    pub fn invalidate_overlapping(
+        &self,
+        modified_span: ByteSpan,
+        entries: &[CarvedEntry],
+        except_entry_idx: Option<usize>,
+    ) -> Vec<usize> {
+        let mut guard = self.records.lock().expect("extraction records lock poisoned");
+        let mut invalidated = Vec::new();
+        for entry in entries {
+            if Some(entry.index) == except_entry_idx {
+                continue;
+            }
+            if entry.span.overlaps(&modified_span) {
+                if let Some(rec) = guard.remove(&entry.index) {
+                    let _ = fs::remove_dir_all(&rec.output_dir);
+                    invalidated.push(entry.index);
+                }
+            }
+        }
+        invalidated
     }
 
     /// Lazily extracts `entry` strictly from `[entry.span.start .. entry.span.end]` on first access.
@@ -217,6 +263,17 @@ impl ExtractionManager {
         entry: &CarvedEntry,
         store: &dyn BinaryStore,
     ) -> Result<()> {
+        self.repack_entry_with_padding(entry, store, true)
+    }
+
+    /// Repacks a modified `/extracted/<entry>/` directory and writes the new bytes back into
+    /// `entry.span` in `store`, using smart signature padding as a fallback when `use_smart_pad` is true.
+    pub fn repack_entry_with_padding(
+        &self,
+        entry: &CarvedEntry,
+        store: &dyn BinaryStore,
+        use_smart_pad: bool,
+    ) -> Result<()> {
         if matches!(store.write_policy(), crate::storage::WritePolicy::ReadOnly) {
             return Err(StorageError::ReadOnly.into());
         }
@@ -239,8 +296,13 @@ impl ExtractionManager {
                 )
             })?;
 
-        let new_blob = repacker.repack(&record.output_dir, entry)?;
-        store.replace_span(entry.span, &new_blob)?;
+        let new_blob = repacker.repack_with_store(&record.output_dir, entry, store)?;
+        let fallback_pad = if use_smart_pad {
+            Some(smart_pad_byte(&entry.signature_result.name))
+        } else {
+            None
+        };
+        store.replace_span_with_fallback_pad(entry.span, &new_blob, fallback_pad)?;
 
         if let Some(rec) = self
             .records

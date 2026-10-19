@@ -637,10 +637,13 @@ dependencies = [
  "aho-corasick",
  "anyhow",
  "binwalk",
+ "bzip2",
  "clap",
+ "crc32fast",
  "ctrlc",
  "daemonize",
  "env_logger",
+ "filetime",
  "flate2",
  "font-kit",
  "fuser",
@@ -651,6 +654,8 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror 1.0.69",
+ "walkdir",
+ "xz2",
 ]
 
 [[package]]

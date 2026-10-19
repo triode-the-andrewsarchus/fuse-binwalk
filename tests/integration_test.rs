@@ -26,6 +26,70 @@ fn make_valid_png() -> Vec<u8> {
     ]
 }
 
+/// Builds a valid SVG document with `<svg ...>...</svg>` markers recognized by Binwalk.
+fn make_valid_svg() -> Vec<u8> {
+    b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\"><rect width=\"16\" height=\"16\" fill=\"red\"/></svg>".to_vec()
+}
+
+/// Builds a valid ZIP archive containing a stored (`method = 0`) SVG file `icon.svg`
+/// and a stored text file `readme.txt`.
+fn make_zip_with_stored_svg(svg_bytes: &[u8]) -> (Vec<u8>, usize, usize) {
+    let name = b"icon.svg";
+    let crc = crc32fast::hash(svg_bytes);
+    let size = svg_bytes.len() as u32;
+
+    let mut out = Vec::new();
+    // 1. Local File Header (PK\x03\x04)
+    let lfh_offset = out.len();
+    out.extend_from_slice(&[0x50, 0x4b, 0x03, 0x04]);
+    out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+    out.extend_from_slice(&0u16.to_le_bytes()); // flags
+    out.extend_from_slice(&0u16.to_le_bytes()); // method = 0 (STORE)
+    out.extend_from_slice(&0u16.to_le_bytes()); // mod_time
+    out.extend_from_slice(&0x21u16.to_le_bytes()); // mod_date
+    out.extend_from_slice(&crc.to_le_bytes()); // crc32 at lfh_offset + 14
+    out.extend_from_slice(&size.to_le_bytes()); // comp_size
+    out.extend_from_slice(&size.to_le_bytes()); // uncomp_size
+    out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // extra len
+    out.extend_from_slice(name);
+    out.extend_from_slice(svg_bytes);
+
+    // 2. Central Directory Header (PK\x01\x02)
+    let cd_offset = out.len();
+    out.extend_from_slice(&[0x50, 0x4b, 0x01, 0x02]);
+    out.extend_from_slice(&0x0314u16.to_le_bytes()); // version made by
+    out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+    out.extend_from_slice(&0u16.to_le_bytes()); // flags
+    out.extend_from_slice(&0u16.to_le_bytes()); // method = 0 (STORE)
+    out.extend_from_slice(&0u16.to_le_bytes()); // mod_time
+    out.extend_from_slice(&0x21u16.to_le_bytes()); // mod_date
+    out.extend_from_slice(&crc.to_le_bytes()); // crc32 at cd_offset + 16
+    out.extend_from_slice(&size.to_le_bytes()); // comp_size
+    out.extend_from_slice(&size.to_le_bytes()); // uncomp_size
+    out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // extra len
+    out.extend_from_slice(&0u16.to_le_bytes()); // comment len
+    out.extend_from_slice(&0u16.to_le_bytes()); // disk number
+    out.extend_from_slice(&0u16.to_le_bytes()); // internal attr
+    out.extend_from_slice(&(0o100644u32 << 16).to_le_bytes()); // external attr
+    out.extend_from_slice(&(lfh_offset as u32).to_le_bytes()); // lfh offset
+    out.extend_from_slice(name);
+    let cd_size = out.len() - cd_offset;
+
+    // 3. End of Central Directory (PK\x05\x06)
+    out.extend_from_slice(&[0x50, 0x4b, 0x05, 0x06]);
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&(cd_size as u32).to_le_bytes());
+    out.extend_from_slice(&(cd_offset as u32).to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+
+    (out, lfh_offset, cd_offset)
+}
+
 /// Builds a valid POSIX ustar archive containing `hello.txt` and `nested.png` (so `nested.png`
 /// overlaps with the enclosing TAR archive!).
 fn make_tar_with_nested_png(png_bytes: &[u8]) -> Vec<u8> {
@@ -85,12 +149,13 @@ fn test_scanner_and_fuse_vfs_end_to_end() {
         assert!(e.span.end <= firmware.len());
     }
 
-    // Verify standalone PNG #1 was found with exact start and end bytes
+    // Verify standalone PNG #1 was found with exact start and end bytes, and filtered out of /extracted/
     let found_png1 = entries
         .iter()
         .find(|e| e.signature_result.name == "png" && e.span.start == png1_start)
         .expect("Standalone PNG #1 should be detected");
     assert_eq!(found_png1.span.end, png1_end);
+    assert!(!found_png1.has_extractor(), "Carve-only PNG should not create a folder in /extracted/");
 
     // Verify TAR archive was found AND nested PNG inside the TAR archive was also found (overlapping!)
     let found_tar = entries
@@ -102,7 +167,11 @@ fn test_scanner_and_fuse_vfs_end_to_end() {
 
     let found_nested_png = entries
         .iter()
-        .find(|e| e.signature_result.name == "png" && e.span.start > tar_start && e.span.end <= found_tar.span.end)
+        .find(|e| {
+            e.signature_result.name == "png"
+                && e.span.start > tar_start
+                && e.span.end <= found_tar.span.end
+        })
         .expect("Nested PNG inside TAR archive should also be detected");
     assert_eq!(found_nested_png.span.len(), png.len());
 
@@ -142,13 +211,9 @@ fn test_scanner_and_fuse_vfs_end_to_end() {
     assert_eq!(png1_read, png);
 
     // Verify read-only enforcement on `/raw/<png1>`
-    assert_eq!(
-        fs.write_node(png1_attr.ino, 0, b"nope"),
-        Err(libc::EROFS)
-    );
+    assert_eq!(fs.write_node(png1_attr.ino, 0, b"nope"), Err(libc::EROFS));
 
     // 4. Verify `/extracted/` lazy on-demand extraction
-    // Before accessing `/extracted/<tar_dir>`, extraction has not run yet
     assert!(fs.extractor_manager().get_cached(found_tar.index).is_none());
 
     let tar_ext_attr = fs
@@ -168,12 +233,8 @@ fn test_scanner_and_fuse_vfs_end_to_end() {
         let hello_bytes = fs
             .read_node(hello_attr.ino, 0, hello_attr.size as u32)
             .unwrap();
-        assert_eq!(
-            hello_bytes,
-            b"Hello from inside a bounded TAR archive!\n"
-        );
+        assert_eq!(hello_bytes, b"Hello from inside a bounded TAR archive!\n");
     } else {
-        // If `tar` CLI wasn't installed in a minimal container, `_extraction_status.txt` must be present
         assert!(child_names.contains(&"_extraction_status.txt"));
     }
 }
@@ -186,7 +247,6 @@ impl RegionRepacker for MockTarballRepacker {
     }
 
     fn repack(&self, extracted_dir: &Path, _entry: &CarvedEntry) -> anyhow::Result<Vec<u8>> {
-        // Read modified `hello.txt` from `extracted_dir` and return a deterministic repacked payload
         let modified = std::fs::read(extracted_dir.join("hello.txt"))?;
         Ok(modified)
     }
@@ -277,4 +337,169 @@ fn test_future_write_and_repack_architecture() {
     store.commit().unwrap();
     let on_disk_after = std::fs::read(temp_backing.path()).unwrap();
     assert_eq!(&on_disk_after[png_start..png_start + 8], b"PATCHED!");
+}
+
+#[test]
+fn test_raw_smart_padding_atomic_rename_and_zip_crc32_sync() {
+    let svg = make_valid_svg();
+    let (zip_bytes, lfh_rel, cd_rel) = make_zip_with_stored_svg(&svg);
+
+    let mut image = vec![0x99u8; 64];
+    let zip_start = image.len();
+    image.extend_from_slice(&zip_bytes);
+
+    let entries = scan_bounded_signatures(&image, &ScanConfig::default()).unwrap();
+    let zip_entry = entries
+        .iter()
+        .find(|e| e.signature_result.name == "zip" && e.span.start == zip_start)
+        .expect("ZIP container should be detected")
+        .clone();
+    let svg_entry = entries
+        .iter()
+        .find(|e| e.signature_result.name == "svg")
+        .expect("Nested SVG inside stored ZIP should be detected")
+        .clone();
+
+    let store = Arc::new(OverlayBinaryStore::from_bytes(
+        image.clone(),
+        None,
+        WritePolicy::InPlaceBounded {
+            pad_byte: None, // Uses smart padding!
+            write_through: false,
+        },
+    ));
+    let mut fs = BinwalkFs::new(store.clone(), entries).unwrap();
+
+    // 1. Test atomic-save editor workflow in `/raw/`:
+    // Create temporary scratch file `.icon.svg.tmp` in `/raw/`, write a shorter SVG to it,
+    // and `rename` it onto `/raw/<svg_entry.raw_filename>`.
+    let shorter_svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"><circle r=\"5\"/></svg>";
+    assert!(shorter_svg.len() < svg.len());
+
+    let scratch_attr = fs
+        .create_node(RAW_DIR_INO, ".icon.svg.tmp", 0o644, libc::O_CREAT | libc::O_WRONLY)
+        .unwrap();
+    fs.write_node(scratch_attr.ino, 0, shorter_svg).unwrap();
+    fs.rename_node(
+        RAW_DIR_INO,
+        ".icon.svg.tmp",
+        RAW_DIR_INO,
+        &svg_entry.raw_filename,
+    )
+    .unwrap();
+
+    // Verify smart padding (`0x20` ASCII space for SVG) filled the remainder of the SVG span
+    let svg_attr = fs
+        .lookup_node(RAW_DIR_INO, &svg_entry.raw_filename)
+        .unwrap();
+    let updated_svg_slice = fs
+        .read_node(svg_attr.ino, 0, svg_attr.size as u32)
+        .unwrap();
+    assert_eq!(updated_svg_slice.len(), svg_entry.span.len());
+    assert_eq!(&updated_svg_slice[..shorter_svg.len()], shorter_svg);
+    assert!(
+        updated_svg_slice[shorter_svg.len()..]
+            .iter()
+            .all(|&b| b == b' '),
+        "Trailing bytes of shorter SVG replacement should be smart-padded with ASCII space (0x20)"
+    );
+
+    // 2. Verify that the enclosing ZIP's Local File Header (+14) and Central Directory Header (+16)
+    // CRC32 checksums were automatically updated to match the modified full `icon.svg` member
+    // (which consists of the 39-byte `<?xml ...?>\n` prefix + the 110-byte `<svg>...</svg>` span)!
+    use fuse_binwalk::BinaryStore;
+    let mut expected_full_member = svg[..39].to_vec();
+    expected_full_member.extend_from_slice(&updated_svg_slice);
+    let expected_new_crc = crc32fast::hash(&expected_full_member);
+    let updated_zip_slice = store.read_slice(zip_entry.span).unwrap();
+
+    let lfh_crc = u32::from_le_bytes(
+        updated_zip_slice[lfh_rel + 14..lfh_rel + 18]
+            .try_into()
+            .unwrap(),
+    );
+    let cd_crc = u32::from_le_bytes(
+        updated_zip_slice[cd_rel + 16..cd_rel + 20]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(
+        lfh_crc, expected_new_crc,
+        "ZIP Local File Header CRC32 should be automatically updated after /raw/ SVG edit"
+    );
+    assert_eq!(
+        cd_crc, expected_new_crc,
+        "ZIP Central Directory Header CRC32 should be automatically updated after /raw/ SVG edit"
+    );
+}
+
+#[test]
+fn test_builtin_zip_repacker_and_truncate_workflow() {
+    let svg = make_valid_svg();
+    let (zip_bytes, lfh_rel, _cd_rel) = make_zip_with_stored_svg(&svg);
+
+    let mut image = vec![0x11u8; 64];
+    let zip_start = image.len();
+    image.extend_from_slice(&zip_bytes);
+
+    let entries = scan_bounded_signatures(&image, &ScanConfig::default()).unwrap();
+    let zip_entry = entries
+        .iter()
+        .find(|e| e.signature_result.name == "zip" && e.span.start == zip_start)
+        .unwrap()
+        .clone();
+    let svg_entry = entries
+        .iter()
+        .find(|e| e.signature_result.name == "svg")
+        .unwrap()
+        .clone();
+
+    let store = Arc::new(OverlayBinaryStore::from_bytes(
+        image,
+        None,
+        WritePolicy::InPlaceBounded {
+            pad_byte: None,
+            write_through: false,
+        },
+    ));
+    let mut fs = BinwalkFs::new(store.clone(), entries).unwrap();
+
+    // Verify that `zip` has a built-in repacker registered by default
+    assert!(fs.is_extracted_entry_writable(zip_entry.index));
+
+    // Test standard truncate(0) -> write -> flush_raw_entry workflow on `/raw/<svg>`
+    let svg_attr = fs
+        .lookup_node(RAW_DIR_INO, &svg_entry.raw_filename)
+        .unwrap();
+    let replacement = b"<svg><path d=\"M0 0\"/></svg>";
+    fs.truncate_node(svg_attr.ino, 0).unwrap();
+    fs.write_node(svg_attr.ino, 0, replacement).unwrap();
+    fs.flush_raw_entry(svg_entry.index).unwrap();
+
+    let read_back = fs
+        .read_node(svg_attr.ino, 0, svg_entry.span.len() as u32)
+        .unwrap();
+    assert_eq!(&read_back[..replacement.len()], replacement);
+    assert!(read_back[replacement.len()..].iter().all(|&b| b == b' '));
+
+    // Also test modifying inside `/extracted/<zip>` if `7z` extracted `icon.svg`
+    let zip_dir_attr = fs
+        .lookup_node(EXTRACTED_DIR_INO, &zip_entry.extracted_dirname)
+        .unwrap();
+    if let Ok(icon_attr) = fs.lookup_node(zip_dir_attr.ino, "icon.svg") {
+        let shorter_icon = b"<svg>repacked-from-extracted</svg>";
+        fs.truncate_node(icon_attr.ino, 0).unwrap();
+        fs.write_node(icon_attr.ino, 0, shorter_icon).unwrap();
+        fs.repack_and_sync_extracted(zip_entry.index).unwrap();
+
+        use fuse_binwalk::BinaryStore;
+        let repacked_zip = store.read_slice(zip_entry.span).unwrap();
+        let expected_crc = crc32fast::hash(shorter_icon);
+        let actual_lfh_crc = u32::from_le_bytes(
+            repacked_zip[lfh_rel + 14..lfh_rel + 18]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(actual_lfh_crc, expected_crc);
+    }
 }

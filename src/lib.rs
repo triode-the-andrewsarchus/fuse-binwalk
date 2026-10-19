@@ -1,5 +1,6 @@
 pub mod extractor;
 pub mod fs;
+pub mod repackers;
 pub mod scanner;
 pub mod storage;
 
@@ -9,4 +10,6 @@ pub use scanner::{
     build_manifest, scan_bounded_signatures, CarvedEntry, ConfidenceLevel, ManifestDocument,
     ManifestEntry, ScanConfig,
 };
-pub use storage::{BinaryStore, ByteSpan, OverlayBinaryStore, StorageError, WritePolicy};
+pub use storage::{
+    smart_pad_byte, BinaryStore, ByteSpan, OverlayBinaryStore, StorageError, WritePolicy,
+};

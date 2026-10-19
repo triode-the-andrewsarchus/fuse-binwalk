@@ -43,6 +43,28 @@ impl ByteSpan {
     }
 }
 
+/// Returns the default smart padding byte for a given Binwalk signature name.
+/// Text-based formats use ASCII space (`0x20`) so trailing padding stays valid,
+/// while binary formats use `0x00`.
+pub fn smart_pad_byte(signature_name: &str) -> u8 {
+    match signature_name {
+        "svg"
+        | "xml"
+        | "html"
+        | "json"
+        | "pem_public_key"
+        | "pem_private_key"
+        | "pem_certificate"
+        | "openssh_private_key"
+        | "pgp"
+        | "copyright"
+        | "sh"
+        | "lua"
+        | "python" => b' ',
+        _ => 0x00,
+    }
+}
+
 /// Defines how write operations are handled by the underlying storage engine.
 ///
 /// The initial milestone uses `WritePolicy::ReadOnly`, while the storage architecture
@@ -115,7 +137,7 @@ impl StorageError {
     }
 }
 
-/// Abstract storage trait for reading and (in future modes) mutating binary spans.
+/// Abstract storage trait for reading and mutating binary spans.
 pub trait BinaryStore: Send + Sync {
     /// Total byte length of the binary image.
     fn total_len(&self) -> usize;
@@ -176,7 +198,18 @@ pub trait BinaryStore: Send + Sync {
 
     /// Atomically replace the contents of `span` with `new_blob` (e.g., after repacking `/extracted/`).
     /// Checks size constraints and applies padding if configured in `WritePolicy`.
-    fn replace_span(&self, span: ByteSpan, new_blob: &[u8]) -> Result<(), StorageError>;
+    fn replace_span(&self, span: ByteSpan, new_blob: &[u8]) -> Result<(), StorageError> {
+        self.replace_span_with_fallback_pad(span, new_blob, None)
+    }
+
+    /// Atomically replace the contents of `span` with `new_blob`, using the policy's configured
+    /// `pad_byte` if present, or `fallback_pad` (such as smart signature padding) otherwise.
+    fn replace_span_with_fallback_pad(
+        &self,
+        span: ByteSpan,
+        new_blob: &[u8],
+        fallback_pad: Option<u8>,
+    ) -> Result<(), StorageError>;
 
     /// Returns true if the CoW overlay holds uncommitted modifications.
     fn is_dirty(&self) -> bool;
@@ -374,7 +407,12 @@ impl BinaryStore for OverlayBinaryStore {
         Ok(data.len())
     }
 
-    fn replace_span(&self, span: ByteSpan, new_blob: &[u8]) -> Result<(), StorageError> {
+    fn replace_span_with_fallback_pad(
+        &self,
+        span: ByteSpan,
+        new_blob: &[u8],
+        fallback_pad: Option<u8>,
+    ) -> Result<(), StorageError> {
         if span.end > self.total_len() {
             return Err(StorageError::SpanOutOfRange {
                 start: span.start,
@@ -383,7 +421,7 @@ impl BinaryStore for OverlayBinaryStore {
             });
         }
 
-        let (pad_byte, write_through) = match self.policy {
+        let (policy_pad, write_through) = match self.policy {
             WritePolicy::ReadOnly => return Err(StorageError::ReadOnly),
             WritePolicy::InPlaceBounded {
                 pad_byte,
@@ -391,6 +429,8 @@ impl BinaryStore for OverlayBinaryStore {
             } => (pad_byte, write_through),
             WritePolicy::CopyOnWriteOverlay { pad_byte } => (pad_byte, false),
         };
+
+        let effective_pad = policy_pad.or(fallback_pad);
 
         let span_len = span.len();
         if new_blob.len() > span_len {
@@ -401,7 +441,7 @@ impl BinaryStore for OverlayBinaryStore {
         }
 
         let payload: Vec<u8> = if new_blob.len() < span_len {
-            let Some(pad) = pad_byte else {
+            let Some(pad) = effective_pad else {
                 return Err(StorageError::ReplacementUnderflow {
                     new_len: new_blob.len(),
                     span_len,
