@@ -132,7 +132,7 @@ pub fn scan_bounded_signatures(file_data: &[u8], config: &ScanConfig) -> Result<
                         &mut sig_result,
                         signature,
                         &binwalker,
-                        available_data,
+                        file_data,
                         min_conf,
                     ) {
                         let key = (sig_result.offset, sig_result.size, sig_result.name.clone());
@@ -146,11 +146,24 @@ pub fn scan_bounded_signatures(file_data: &[u8], config: &ScanConfig) -> Result<
         }
     }
 
-    // 2. Run Aho-Corasick overlapping pattern search across the entire binary without skipping
-    // over matched spans, so nested and overlapping bounded files are all discovered.
+    // 2. Run Aho-Corasick overlapping pattern search across the entire binary.
+    // Track the active end offset per signature type so multi-record containers (like `zip` or `tarball`)
+    // don't redundantly re-parse every internal record as a truncated copy of the outer container,
+    // while still allowing all OTHER signature types (like `png`, `jpeg`, `gzip`, etc.) inside the container to be found!
     if !binwalker.patterns.is_empty() {
         let ac = AhoCorasick::new(&binwalker.patterns)
             .map_err(|e| anyhow!("Failed to build Aho-Corasick automaton: {e}"))?;
+
+        let mut active_end_by_sig: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+
+        // Binwalk's `zip` parser scans from `offset` to EOF looking for `PK\x05\x06\x00\x00\x00\x00` on every `PK\x03\x04`.
+        // Pre-compute the last offset of `PK\x05\x06\x00\x00\x00\x00` so we don't do O(N^2) scans when a file (like Firefox's omni.ja)
+        // has thousands of `PK\x03\x04` entries without standard EOCD magic.
+        const ZIP_EOCD_MAGIC: &[u8; 8] = b"PK\x05\x06\x00\x00\x00\x00";
+        let last_zip_eocd_offset: Option<usize> = file_data
+            .windows(ZIP_EOCD_MAGIC.len())
+            .rposition(|w| w == ZIP_EOCD_MAGIC);
 
         for mat in ac.find_overlapping_iter(file_data) {
             let magic_offset = mat.start();
@@ -159,14 +172,34 @@ pub fn scan_bounded_signatures(file_data: &[u8], config: &ScanConfig) -> Result<
                 continue;
             };
 
+            if let Some(&active_end) = active_end_by_sig.get(&signature.name) {
+                if magic_offset < active_end {
+                    continue;
+                }
+            }
+
+            if signature.name == "zip" {
+                match last_zip_eocd_offset {
+                    None => continue,
+                    Some(last_eocd) if magic_offset > last_eocd => continue,
+                    _ => {}
+                }
+            }
+
             if let Ok(mut sig_result) = (signature.parser)(file_data, magic_offset) {
                 if let Some(extractor) = validate_and_populate(
                     &mut sig_result,
                     signature,
                     &binwalker,
-                    available_data,
+                    file_data,
                     min_conf,
                 ) {
+                    let sig_end = sig_result.offset.saturating_add(sig_result.size);
+                    let prev_end = active_end_by_sig.entry(sig_result.name.clone()).or_insert(0);
+                    if sig_end > *prev_end {
+                        *prev_end = sig_end;
+                    }
+
                     let key = (sig_result.offset, sig_result.size, sig_result.name.clone());
                     if seen_keys.insert(key) {
                         raw_matches.push((sig_result, extractor));
@@ -205,7 +238,11 @@ pub fn scan_bounded_signatures(file_data: &[u8], config: &ScanConfig) -> Result<
             suffix += 1;
         }
 
-        let ext = infer_extension(&sig_result.name, extractor.as_ref());
+        let ext = infer_extension(
+            &sig_result.name,
+            &sig_result.description,
+            extractor.as_ref(),
+        );
         let raw_filename = format!("{stem}.{ext}");
         let extracted_dirname = stem;
 
@@ -222,14 +259,41 @@ pub fn scan_bounded_signatures(file_data: &[u8], config: &ScanConfig) -> Result<
     Ok(entries)
 }
 
+/// Returns true for leaf formats whose Binwalk "extractor" merely carves the raw `[start..end]`
+/// slice to disk without unpacking, decompressing, or transforming it (which is redundant with `/raw/`).
+fn is_carve_only_signature(sig_name: &str) -> bool {
+    matches!(
+        sig_name,
+        "png"
+            | "jpeg"
+            | "gif"
+            | "svg"
+            | "riff"
+            | "pcapng"
+            | "pem_certificate"
+            | "pem_public_key"
+            | "pem_private_key"
+    )
+}
+
 fn validate_and_populate(
     sig_result: &mut SignatureResult,
     signature: &Signature,
     binwalker: &Binwalk,
-    available_data: usize,
+    file_data: &[u8],
     min_conf: u8,
 ) -> Option<Option<Extractor>> {
-    // Must have an explicitly known non-zero size from the signature parser itself
+    let available_data = file_data.len();
+
+    // Binwalk's built-in `elf` parser validates the ELF header but leaves `size = 0`;
+    // compute the exact ELF boundary from its program/section header tables when available.
+    if sig_result.size == 0 && signature.name == "elf" {
+        if let Some(elf_size) = infer_elf_size(file_data.get(sig_result.offset..)?) {
+            sig_result.size = elf_size;
+        }
+    }
+
+    // Must have an explicitly known non-zero size
     if sig_result.size == 0 {
         return None;
     }
@@ -247,7 +311,7 @@ fn validate_and_populate(
     sig_result.name = signature.name.clone();
     sig_result.always_display = signature.always_display;
 
-    let extractor = if sig_result.extraction_declined {
+    let extractor = if sig_result.extraction_declined || is_carve_only_signature(&signature.name) {
         None
     } else if let Some(pref) = &sig_result.preferred_extractor {
         if matches!(pref.utility, ExtractorType::None) {
@@ -266,6 +330,111 @@ fn validate_and_populate(
     Some(extractor)
 }
 
+/// Computes the exact byte length of an ELF binary from its ELF header, program headers, and section headers.
+fn infer_elf_size(slice: &[u8]) -> Option<usize> {
+    if slice.len() < 64 || &slice[0..4] != b"\x7FELF" {
+        return None;
+    }
+    let class = slice[4];
+    let endian = slice[5];
+    let is_le = match endian {
+        1 => true,
+        2 => false,
+        _ => return None,
+    };
+
+    let read_u16 = |off: usize| -> Option<u16> {
+        let b: [u8; 2] = slice.get(off..off + 2)?.try_into().ok()?;
+        Some(if is_le { u16::from_le_bytes(b) } else { u16::from_be_bytes(b) })
+    };
+    let read_u32 = |off: usize| -> Option<u32> {
+        let b: [u8; 4] = slice.get(off..off + 4)?.try_into().ok()?;
+        Some(if is_le { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) })
+    };
+    let read_u64 = |off: usize| -> Option<u64> {
+        let b: [u8; 8] = slice.get(off..off + 8)?.try_into().ok()?;
+        Some(if is_le { u64::from_le_bytes(b) } else { u64::from_be_bytes(b) })
+    };
+
+    const SHT_NOBITS: u32 = 8;
+
+    let mut max_end: usize = 0;
+
+    if class == 1 {
+        // 32-bit ELF
+        let phoff = read_u32(28)? as usize;
+        let shoff = read_u32(32)? as usize;
+        let ehsize = read_u16(40)? as usize;
+        let phentsize = read_u16(42)? as usize;
+        let phnum = read_u16(44)? as usize;
+        let shentsize = read_u16(46)? as usize;
+        let shnum = read_u16(48)? as usize;
+
+        max_end = max_end.max(ehsize);
+        if phoff > 0 && phnum > 0 {
+            max_end = max_end.max(phoff.checked_add(phentsize.checked_mul(phnum)?)?);
+            for i in 0..phnum {
+                let p_base = phoff.checked_add(i.checked_mul(phentsize)?)?;
+                let p_offset = read_u32(p_base + 4)? as usize;
+                let p_filesz = read_u32(p_base + 16)? as usize;
+                max_end = max_end.max(p_offset.checked_add(p_filesz)?);
+            }
+        }
+        if shoff > 0 && shnum > 0 {
+            max_end = max_end.max(shoff.checked_add(shentsize.checked_mul(shnum)?)?);
+            for i in 0..shnum {
+                let s_base = shoff.checked_add(i.checked_mul(shentsize)?)?;
+                let sh_type = read_u32(s_base + 4)?;
+                if sh_type != SHT_NOBITS {
+                    let sh_offset = read_u32(s_base + 16)? as usize;
+                    let sh_size = read_u32(s_base + 20)? as usize;
+                    max_end = max_end.max(sh_offset.checked_add(sh_size)?);
+                }
+            }
+        }
+    } else if class == 2 {
+        // 64-bit ELF
+        let phoff = usize::try_from(read_u64(32)?).ok()?;
+        let shoff = usize::try_from(read_u64(40)?).ok()?;
+        let ehsize = read_u16(52)? as usize;
+        let phentsize = read_u16(54)? as usize;
+        let phnum = read_u16(56)? as usize;
+        let shentsize = read_u16(58)? as usize;
+        let shnum = read_u16(60)? as usize;
+
+        max_end = max_end.max(ehsize);
+        if phoff > 0 && phnum > 0 {
+            max_end = max_end.max(phoff.checked_add(phentsize.checked_mul(phnum)?)?);
+            for i in 0..phnum {
+                let p_base = phoff.checked_add(i.checked_mul(phentsize)?)?;
+                let p_offset = usize::try_from(read_u64(p_base + 8)?).ok()?;
+                let p_filesz = usize::try_from(read_u64(p_base + 32)?).ok()?;
+                max_end = max_end.max(p_offset.checked_add(p_filesz)?);
+            }
+        }
+        if shoff > 0 && shnum > 0 {
+            max_end = max_end.max(shoff.checked_add(shentsize.checked_mul(shnum)?)?);
+            for i in 0..shnum {
+                let s_base = shoff.checked_add(i.checked_mul(shentsize)?)?;
+                let sh_type = read_u32(s_base + 4)?;
+                if sh_type != SHT_NOBITS {
+                    let sh_offset = usize::try_from(read_u64(s_base + 24)?).ok()?;
+                    let sh_size = usize::try_from(read_u64(s_base + 32)?).ok()?;
+                    max_end = max_end.max(sh_offset.checked_add(sh_size)?);
+                }
+            }
+        }
+    } else {
+        return None;
+    }
+
+    if max_end > 0 && max_end <= slice.len() {
+        Some(max_end)
+    } else {
+        None
+    }
+}
+
 fn sanitize_component(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for ch in name.chars() {
@@ -282,44 +451,73 @@ fn sanitize_component(name: &str) -> String {
     }
 }
 
-fn infer_extension(sig_name: &str, extractor: Option<&Extractor>) -> String {
+fn infer_extension(sig_name: &str, description: &str, extractor: Option<&Extractor>) -> String {
+    match sig_name {
+        "png" => return "png".to_string(),
+        "jpeg" => return "jpg".to_string(),
+        "gif" => return "gif".to_string(),
+        "svg" => return "svg".to_string(),
+        "riff" => {
+            if description.contains("WEBP") {
+                return "webp".to_string();
+            } else if description.contains("WAVE") {
+                return "wav".to_string();
+            } else if description.contains("AVI") {
+                return "avi".to_string();
+            }
+            return "riff".to_string();
+        }
+        "pcapng" => return "pcapng".to_string(),
+        "pem_certificate" => return "crt".to_string(),
+        "pem_public_key" | "pem_private_key" | "pem_key" => return "pem".to_string(),
+        "gzip" => return "gz".to_string(),
+        "bzip2" => return "bz2".to_string(),
+        "xz" => return "xz".to_string(),
+        "zstd" => return "zst".to_string(),
+        "lz4" => return "lz4".to_string(),
+        "lzfse" => return "lzfse".to_string(),
+        "lzma" => return "lzma".to_string(),
+        "lzop" => return "lzo".to_string(),
+        "zlib" => return "zlib".to_string(),
+        "zip" => return "zip".to_string(),
+        "7zip" => return "7z".to_string(),
+        "rar" => return "rar".to_string(),
+        "cab" => return "cab".to_string(),
+        "dmg" => return "dmg".to_string(),
+        "tar" | "tarball" => return "tar".to_string(),
+        "cpio" => return "cpio".to_string(),
+        "squashfs" => return "sqsh".to_string(),
+        "cramfs" => return "cramfs".to_string(),
+        "romfs" => return "romfs".to_string(),
+        "jffs2" => return "jffs2".to_string(),
+        "yaffs" => return "yaffs".to_string(),
+        "ubi" => return "ubi".to_string(),
+        "ubifs" => return "ubifs".to_string(),
+        "ext" => return "ext".to_string(),
+        "fat" => return "fat".to_string(),
+        "ntfs" => return "ntfs".to_string(),
+        "apfs" => return "apfs".to_string(),
+        "btrfs" => return "btrfs".to_string(),
+        "iso9660" => return "iso".to_string(),
+        "elf" => return "elf".to_string(),
+        "pe" => return "exe".to_string(),
+        "dtb" => return "dtb".to_string(),
+        "uimage" | "fit" | "mbr" | "efigpt" | "android_sparse" => return "img".to_string(),
+        "pdf" => return "pdf".to_string(),
+        "xml" => return "xml".to_string(),
+        "srecord" | "srecord_generic" => return "srec".to_string(),
+        "openssl" | "openssl_crypt" => return "enc".to_string(),
+        _ => {}
+    }
+
     if let Some(ext) = extractor {
         let trimmed = ext.extension.trim().trim_start_matches('.');
         if !trimmed.is_empty() {
             return sanitize_component(trimmed);
         }
     }
-    match sig_name {
-        "png" => "png",
-        "jpeg" => "jpg",
-        "gif" => "gif",
-        "gzip" => "gz",
-        "bzip2" => "bz2",
-        "xz" => "xz",
-        "zstd" => "zst",
-        "lz4" => "lz4",
-        "lzma" => "lzma",
-        "zip" => "zip",
-        "tar" | "tarball" => "tar",
-        "cpio" => "cpio",
-        "squashfs" => "sqsh",
-        "cramfs" => "cramfs",
-        "romfs" => "romfs",
-        "jffs2" => "jffs2",
-        "ubifs" => "ubifs",
-        "ext" => "ext",
-        "iso9660" => "iso",
-        "elf" => "elf",
-        "pe" => "exe",
-        "dtb" => "dtb",
-        "uimage" | "fit" => "img",
-        "pdf" => "pdf",
-        "xml" => "xml",
-        "openssl_crypt" => "enc",
-        "pem_certificate" | "pem_key" => "pem",
-        _ => "bin",
-    }
-    .to_string()
+
+    "bin".to_string()
 }
 
 pub fn build_manifest(binary_size: usize, entries: &[CarvedEntry]) -> ManifestDocument {

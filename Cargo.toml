@@ -24,3 +24,7 @@ font-kit = { version = "0.14", features = ["source-fontconfig-dlopen"] }
 [dev-dependencies]
 flate2 = "1.0"
 tar = "0.4"
+
+[profile.dev]
+opt-level = 2
+

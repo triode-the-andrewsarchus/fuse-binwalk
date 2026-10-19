@@ -60,6 +60,19 @@ fn main() -> Result<()> {
             cli.binary_path.display()
         )
     })?;
+
+    // If the mountpoint has an active or stale FUSE mount from a previous run, unmount it cleanly first
+    let _ = std::process::Command::new("fusermount3")
+        .args(["-u", "-z"])
+        .arg(&cli.mountpoint)
+        .status()
+        .or_else(|_| {
+            std::process::Command::new("fusermount")
+                .args(["-u", "-z"])
+                .arg(&cli.mountpoint)
+                .status()
+        });
+
     let mountpoint = std::fs::canonicalize(&cli.mountpoint).with_context(|| {
         format!(
             "Failed to resolve mountpoint '{}'",
