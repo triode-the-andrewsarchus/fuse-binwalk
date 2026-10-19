@@ -18,8 +18,8 @@ fn make_valid_png() -> Vec<u8> {
         0x90, 0x77, 0x53, 0xDE, // IHDR CRC
         0x00, 0x00, 0x00, 0x0C, // IDAT length = 12
         0x49, 0x44, 0x41, 0x54, // "IDAT"
-        0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00,
-        0x18, 0xDD, 0x8D, 0xB0, // IDAT CRC
+        0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D,
+        0xB0, // IDAT CRC
         0x00, 0x00, 0x00, 0x00, // IEND length = 0
         0x49, 0x45, 0x4E, 0x44, // "IEND"
         0xAE, 0x42, 0x60, 0x82, // IEND CRC
@@ -143,7 +143,10 @@ fn test_scanner_and_fuse_vfs_end_to_end() {
         .expect("scan_bounded_signatures should succeed");
 
     // Every discovered entry must have size > 0 and valid [start..end] within firmware
-    assert!(!entries.is_empty(), "Expected bounded signatures to be found");
+    assert!(
+        !entries.is_empty(),
+        "Expected bounded signatures to be found"
+    );
     for e in &entries {
         assert!(e.span.len() > 0);
         assert!(e.span.end <= firmware.len());
@@ -155,7 +158,10 @@ fn test_scanner_and_fuse_vfs_end_to_end() {
         .find(|e| e.signature_result.name == "png" && e.span.start == png1_start)
         .expect("Standalone PNG #1 should be detected");
     assert_eq!(found_png1.span.end, png1_end);
-    assert!(!found_png1.has_extractor(), "Carve-only PNG should not create a folder in /extracted/");
+    assert!(
+        !found_png1.has_extractor(),
+        "Carve-only PNG should not create a folder in /extracted/"
+    );
 
     // Verify TAR archive was found AND nested PNG inside the TAR archive was also found (overlapping!)
     let found_tar = entries
@@ -163,7 +169,10 @@ fn test_scanner_and_fuse_vfs_end_to_end() {
         .find(|e| e.signature_result.name == "tarball" && e.span.start == tar_start)
         .expect("TAR archive should be detected");
     assert!(found_tar.span.end <= tar_end && found_tar.span.len() >= 1024);
-    assert!(found_tar.has_extractor(), "TAR signature should have an extractor");
+    assert!(
+        found_tar.has_extractor(),
+        "TAR signature should have an extractor"
+    );
 
     let found_nested_png = entries
         .iter()
@@ -327,7 +336,9 @@ fn test_future_write_and_repack_architecture() {
         let raw_tar_attr = fs
             .lookup_node(RAW_DIR_INO, &tar_entry.raw_filename)
             .unwrap();
-        let repacked_head = fs.read_node(raw_tar_attr.ino, 0, new_msg.len() as u32).unwrap();
+        let repacked_head = fs
+            .read_node(raw_tar_attr.ino, 0, new_msg.len() as u32)
+            .unwrap();
         assert_eq!(repacked_head, new_msg);
         let _ = tar_end;
     }
@@ -377,7 +388,12 @@ fn test_raw_smart_padding_atomic_rename_and_zip_crc32_sync() {
     assert!(shorter_svg.len() < svg.len());
 
     let scratch_attr = fs
-        .create_node(RAW_DIR_INO, ".icon.svg.tmp", 0o644, libc::O_CREAT | libc::O_WRONLY)
+        .create_node(
+            RAW_DIR_INO,
+            ".icon.svg.tmp",
+            0o644,
+            libc::O_CREAT | libc::O_WRONLY,
+        )
         .unwrap();
     fs.write_node(scratch_attr.ino, 0, shorter_svg).unwrap();
     fs.rename_node(
@@ -392,9 +408,7 @@ fn test_raw_smart_padding_atomic_rename_and_zip_crc32_sync() {
     let svg_attr = fs
         .lookup_node(RAW_DIR_INO, &svg_entry.raw_filename)
         .unwrap();
-    let updated_svg_slice = fs
-        .read_node(svg_attr.ino, 0, svg_attr.size as u32)
-        .unwrap();
+    let updated_svg_slice = fs.read_node(svg_attr.ino, 0, svg_attr.size as u32).unwrap();
     assert_eq!(updated_svg_slice.len(), svg_entry.span.len());
     assert_eq!(&updated_svg_slice[..shorter_svg.len()], shorter_svg);
     assert!(
@@ -495,11 +509,8 @@ fn test_builtin_zip_repacker_and_truncate_workflow() {
         use fuse_binwalk::BinaryStore;
         let repacked_zip = store.read_slice(zip_entry.span).unwrap();
         let expected_crc = crc32fast::hash(shorter_icon);
-        let actual_lfh_crc = u32::from_le_bytes(
-            repacked_zip[lfh_rel + 14..lfh_rel + 18]
-                .try_into()
-                .unwrap(),
-        );
+        let actual_lfh_crc =
+            u32::from_le_bytes(repacked_zip[lfh_rel + 14..lfh_rel + 18].try_into().unwrap());
         assert_eq!(actual_lfh_crc, expected_crc);
     }
 }

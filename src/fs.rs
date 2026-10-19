@@ -1,3 +1,9 @@
+//! Virtual inode tree and [`fuser::Filesystem`] implementation for `fuse-binwalk`.
+//!
+//! This module implements [`BinwalkFs`], which exposes carved `/raw/` byte slices,
+//! lazily extracted `/extracted/` directories, and `/manifest.json` as a POSIX-compatible
+//! FUSE filesystem.
+
 use crate::extractor::ExtractionManager;
 use crate::scanner::{build_manifest, CarvedEntry};
 use crate::storage::{smart_pad_byte, BinaryStore, WritePolicy};
@@ -15,57 +21,103 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const ROOT_INO: u64 = FUSE_ROOT_ID; // 1
+/// Fixed FUSE inode number (`1`) for the root directory (`/`).
+pub const ROOT_INO: u64 = FUSE_ROOT_ID;
+/// Fixed FUSE inode number (`2`) for the `/raw` directory.
 pub const RAW_DIR_INO: u64 = 2;
+/// Fixed FUSE inode number (`3`) for the `/extracted` directory.
 pub const EXTRACTED_DIR_INO: u64 = 3;
+/// Fixed FUSE inode number (`4`) for the `/manifest.json` file.
 pub const MANIFEST_INO: u64 = 4;
 const FIRST_DYNAMIC_INO: u64 = 100;
 
 const TTL: Duration = Duration::from_secs(1);
 const BLOCK_SIZE: u32 = 512;
 
+/// Classifies the backing target of a virtual inode in [`BinwalkFs`].
 #[derive(Debug, Clone)]
 pub enum InodeKind {
-    /// `/`
+    /// Root directory (`/`).
     RootDir,
-    /// `/raw`
+    /// Top-level `/raw` directory containing carved byte slices.
     RawDir,
-    /// `/extracted`
+    /// Top-level `/extracted` directory containing container subdirectories.
     ExtractedTopDir,
-    /// `/manifest.json`
+    /// Top-level `/manifest.json` summary catalog file.
     ManifestFile,
-    /// `/raw/<0xSTART_0xEND_name.ext>`
-    RawSlice { entry_idx: usize },
-    /// Ephemeral scratch file inside `/raw/` (supports atomic-save editors like `vim`, `sed -i`, GUI apps)
-    RawScratchFile { data: Vec<u8>, perm: u16 },
-    /// `/extracted/<0xSTART_0xEND_name>` (triggers lazy extraction when accessed)
-    ExtractedEntryRoot { entry_idx: usize },
-    /// Any file, directory, or symlink inside `/extracted/<0xSTART_0xEND_name>/...`
-    ExtractedHostNode {
+    /// Virtual file under `/raw/` backed by `entries[entry_idx].span`.
+    RawSlice {
+        /// Index into [`BinwalkFs::entries`].
         entry_idx: usize,
+    },
+    /// Ephemeral scratch file inside `/raw/` used by atomic-save editors (`vim`, `sed -i`, GUI apps).
+    RawScratchFile {
+        /// In-memory byte buffer of the temporary file.
+        data: Vec<u8>,
+        /// POSIX permission bits (`0o644` by default).
+        perm: u16,
+    },
+    /// Virtual directory under `/extracted/` that triggers lazy extraction of `entries[entry_idx]`.
+    ExtractedEntryRoot {
+        /// Index into [`BinwalkFs::entries`].
+        entry_idx: usize,
+    },
+    /// File, directory, or symlink inside an extracted container directory on the host.
+    ExtractedHostNode {
+        /// Index of the parent [`CarvedEntry`] in [`BinwalkFs::entries`].
+        entry_idx: usize,
+        /// Backing path inside [`ExtractionManager`]'s temporary workspace.
         host_path: PathBuf,
     },
 }
 
+/// Represents a single node in [`BinwalkFs`]'s virtual inode table.
 #[derive(Debug, Clone)]
 pub struct InodeNode {
+    /// Inode number.
     pub ino: u64,
+    /// Parent directory inode number.
     pub parent: u64,
+    /// Filename component within the parent directory.
     pub name: String,
+    /// Backing classification for this inode.
     pub kind: InodeKind,
-    /// Maps child filename -> child inode number for directory nodes.
+    /// Maps child filenames to child inode numbers for directory nodes.
     pub children: BTreeMap<String, u64>,
     /// Whether a directory backing a host path has been indexed into `children`.
     pub children_loaded: bool,
 }
 
+/// Represents a single directory entry returned by [`BinwalkFs::list_directory`].
 #[derive(Debug, Clone)]
 pub struct DirListingEntry {
+    /// Inode number of the entry.
     pub ino: u64,
+    /// Filename of the entry (including `"."` and `".."`).
     pub name: String,
+    /// FUSE [`FileType`] of the entry.
     pub file_type: FileType,
 }
 
+/// FUSE filesystem driver exposing bounded [`CarvedEntry`] slices and lazy extractions.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use fuse_binwalk::{
+///     scan_bounded_signatures, BinwalkFs, OverlayBinaryStore, ScanConfig, WritePolicy, RAW_DIR_INO,
+/// };
+///
+/// let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>".to_vec();
+/// let entries = scan_bounded_signatures(&svg, &ScanConfig::default())?;
+/// let store = Arc::new(OverlayBinaryStore::from_bytes(svg.clone(), None, WritePolicy::ReadOnly));
+/// let mut fs = BinwalkFs::new(store, entries)?;
+///
+/// let raw_list = fs.list_directory(RAW_DIR_INO).unwrap();
+/// assert_eq!(raw_list.len(), 3); // ".", "..", and the carved .svg slice
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 pub struct BinwalkFs {
     store: Arc<dyn BinaryStore>,
     entries: Vec<CarvedEntry>,
@@ -76,8 +128,8 @@ pub struct BinwalkFs {
     /// Staging buffers for `/raw/<entry>` files that were truncated (`O_TRUNC` / `setattr(size)`)
     /// and are being rewritten prior to `flush`/`release`.
     raw_write_buffers: HashMap<usize, Vec<u8>>,
-    /// When true, underflow replacements are rejected with `EINVAL` unless an explicit `pad_byte`
-    /// is configured in `WritePolicy`. When false (default), smart signature padding is used.
+    /// When `true`, underflow replacements are rejected with `EINVAL` unless an explicit `pad_byte`
+    /// is configured in [`WritePolicy`]. When `false` (default), smart signature padding is used.
     strict_size: bool,
     next_ino: u64,
     mount_time: SystemTime,
@@ -86,6 +138,12 @@ pub struct BinwalkFs {
 }
 
 impl BinwalkFs {
+    /// Creates a new [`BinwalkFs`] instance from a [`BinaryStore`] and discovered [`CarvedEntry`] list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serializing `/manifest.json` or initializing the temporary
+    /// [`ExtractionManager`] workspace fails.
     pub fn new(store: Arc<dyn BinaryStore>, entries: Vec<CarvedEntry>) -> anyhow::Result<Self> {
         let manifest_doc = build_manifest(store.total_len(), &entries);
         let mut manifest_bytes = serde_json::to_vec_pretty(&manifest_doc)?;
@@ -115,19 +173,24 @@ impl BinwalkFs {
         Ok(fs)
     }
 
+    /// Configures whether underflow span replacements should be rejected (`true`) instead of
+    /// using [`smart_pad_byte`] (`false`).
     pub fn with_strict_size(mut self, strict_size: bool) -> Self {
         self.strict_size = strict_size;
         self
     }
 
+    /// Returns a reference to the underlying [`BinaryStore`].
     pub fn store(&self) -> &Arc<dyn BinaryStore> {
         &self.store
     }
 
+    /// Returns the slice of bounded [`CarvedEntry`] records exposed by this filesystem.
     pub fn entries(&self) -> &[CarvedEntry] {
         &self.entries
     }
 
+    /// Returns a reference to the [`ExtractionManager`] handling `/extracted/`.
     pub fn extractor_manager(&self) -> &ExtractionManager {
         &self.extractor
     }
@@ -232,12 +295,15 @@ impl BinwalkFs {
         );
     }
 
+    /// Returns `true` if the underlying [`BinaryStore`] is mounted with a writable [`WritePolicy`].
     pub fn is_writable(&self) -> bool {
         !matches!(self.store.write_policy(), WritePolicy::ReadOnly)
     }
 
-    /// Returns true if `/extracted/<entry>/` is writable (filesystem is mounted writable AND
-    /// a `RegionRepacker` is available for this entry's signature).
+    /// Returns `true` if `/extracted/<entry>/` is writable.
+    ///
+    /// An extracted directory is writable when [`Self::is_writable`] is `true` and an available
+    /// [`crate::RegionRepacker`] is registered for `entries[entry_idx].signature_result.name`.
     pub fn is_extracted_entry_writable(&self, entry_idx: usize) -> bool {
         self.is_writable()
             && self
@@ -291,8 +357,12 @@ impl BinwalkFs {
         }
     }
 
-    /// Ensures that if `dir_ino` is an `ExtractedEntryRoot` or an `ExtractedHostNode` directory,
-    /// lazy extraction has completed and its direct children are registered in `self.inodes`.
+    /// Ensures that lazy extraction has completed for `dir_ino` and indexes its direct children.
+    ///
+    /// # Errors
+    ///
+    /// Returns a POSIX `errno` (`ENOENT`, `ENOTDIR`, or `EIO`) if `dir_ino` does not exist,
+    /// is not a directory, or if host directory synchronization fails.
     pub fn ensure_directory_populated(&mut self, dir_ino: u64) -> Result<(), libc::c_int> {
         let (kind, already_loaded) = {
             let Some(node) = self.inodes.get(&dir_ino) else {
@@ -420,10 +490,7 @@ impl BinwalkFs {
         }
     }
 
-    /// Post-write hook whenever a `/raw/<entry>` byte span is modified:
-    /// 1. Invalidates any cached `/extracted/` directories whose span overlaps `entry.span`.
-    /// 2. Updates parent ZIP Local/Central Directory CRC32 headers if `entry.span` lies inside
-    ///    an uncompressed (`STORE`) ZIP archive entry.
+    /// Invalidates overlapping `/extracted/` caches and updates parent ZIP CRC32 headers after a `/raw/` edit.
     fn on_raw_span_modified(&mut self, entry_idx: usize) {
         let span = self.entries[entry_idx].span;
         let invalidated = self
@@ -432,11 +499,7 @@ impl BinwalkFs {
         for inv_idx in invalidated {
             self.clear_extracted_inodes_for_entry(inv_idx);
         }
-        let _ = crate::repackers::sync_parent_zip_crc32_for_span(
-            span,
-            &self.entries,
-            &*self.store,
-        );
+        let _ = crate::repackers::sync_parent_zip_crc32_for_span(span, &self.entries, &*self.store);
     }
 
     /// Replaces the entire span of a `/raw/<entry>` slice, applying smart padding (unless `strict_size`
@@ -460,11 +523,14 @@ impl BinwalkFs {
         Ok(())
     }
 
-    /// Flushes any staged truncated `/raw/<entry>` buffer into `self.store`.
+    /// Flushes any staged truncated `/raw/<entry>` write buffer into the underlying [`BinaryStore`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a POSIX `errno` (`ENOSPC`, `EINVAL`, `EROFS`, or `EIO`) if replacing the span fails.
     pub fn flush_raw_entry(&mut self, entry_idx: usize) -> Result<(), libc::c_int> {
         if let Some(staged) = self.raw_write_buffers.remove(&entry_idx) {
             if let Err(errno) = self.apply_raw_slice_replacement(entry_idx, &staged) {
-                // Restore buffer on error so state isn't lost if caller inspects it
                 self.raw_write_buffers.insert(entry_idx, staged);
                 return Err(errno);
             }
@@ -472,8 +538,13 @@ impl BinwalkFs {
         Ok(())
     }
 
-    /// Repacks a modified `/extracted/<entry>/` directory into its parent span in `self.store`
+    /// Repacks a modified `/extracted/<entry>/` directory into its parent span in [`BinaryStore`]
     /// and invalidates any other overlapping cached extractions.
+    ///
+    /// # Errors
+    ///
+    /// Returns a POSIX `errno` (`EACCES`, `ENOSPC`, `EINVAL`, or `EIO`) if the entry is not
+    /// writable or if repacking/replacement fails.
     pub fn repack_and_sync_extracted(&mut self, entry_idx: usize) -> Result<(), libc::c_int> {
         let entry = self.entries[entry_idx].clone();
         if !self.is_extracted_entry_writable(entry_idx) {
@@ -498,6 +569,11 @@ impl BinwalkFs {
         Ok(())
     }
 
+    /// Computes FUSE [`FileAttr`] metadata for `ino`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `libc::ENOENT` if `ino` does not exist in the inode table or backing host directory.
     pub fn compute_attr(&self, ino: u64) -> Result<FileAttr, libc::c_int> {
         let Some(node) = self.inodes.get(&ino) else {
             return Err(libc::ENOENT);
@@ -542,13 +618,9 @@ impl BinwalkFs {
                     1,
                 ))
             }
-            InodeKind::RawScratchFile { data, perm } => Ok(self.make_attr(
-                ino,
-                FileType::RegularFile,
-                data.len() as u64,
-                *perm,
-                1,
-            )),
+            InodeKind::RawScratchFile { data, perm } => {
+                Ok(self.make_attr(ino, FileType::RegularFile, data.len() as u64, *perm, 1))
+            }
             InodeKind::ExtractedEntryRoot { entry_idx } => {
                 let entry_writable = self.is_extracted_entry_writable(*entry_idx);
                 let nlink = 2 + node.children.len() as u32;
@@ -567,7 +639,11 @@ impl BinwalkFs {
                 let entry_writable = self.is_extracted_entry_writable(*entry_idx);
                 let md = fs::symlink_metadata(host_path).map_err(|_| libc::ENOENT)?;
                 let ft = metadata_to_filetype(&md);
-                let size = if ft == FileType::Directory { 0 } else { md.len() };
+                let size = if ft == FileType::Directory {
+                    0
+                } else {
+                    md.len()
+                };
                 let perm = match ft {
                     FileType::Directory => self.default_dir_perm(entry_writable),
                     FileType::Symlink => 0o777,
@@ -586,14 +662,7 @@ impl BinwalkFs {
         }
     }
 
-    fn make_attr(
-        &self,
-        ino: u64,
-        kind: FileType,
-        size: u64,
-        perm: u16,
-        nlink: u32,
-    ) -> FileAttr {
+    fn make_attr(&self, ino: u64, kind: FileType, size: u64, perm: u16, nlink: u32) -> FileAttr {
         let blocks = size.div_ceil(u64::from(BLOCK_SIZE));
         FileAttr {
             ino,
@@ -614,7 +683,13 @@ impl BinwalkFs {
         }
     }
 
-    /// High-level lookup helper (also usable directly in integration tests).
+    /// Resolves a child entry `name` inside the directory `parent` and returns its [`FileAttr`].
+    ///
+    /// Populates lazy `/extracted/` directory children on demand before performing the lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ENOENT` if `parent` or `name` does not exist, or `EIO` if lazy extraction fails.
     pub fn lookup_node(&mut self, parent: u64, name: &str) -> Result<FileAttr, libc::c_int> {
         self.ensure_directory_populated(parent)?;
 
@@ -634,7 +709,13 @@ impl BinwalkFs {
         self.compute_attr(child_ino)
     }
 
-    /// High-level directory listing helper (also usable directly in integration tests).
+    /// Lists all entries inside the directory `ino`, including `.` and `..`.
+    ///
+    /// Populates lazy `/extracted/` directory children on demand before enumerating entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ENOENT` if `ino` does not exist, or `EIO` if lazy extraction fails.
     pub fn list_directory(&mut self, ino: u64) -> Result<Vec<DirListingEntry>, libc::c_int> {
         self.ensure_directory_populated(ino)?;
 
@@ -670,7 +751,12 @@ impl BinwalkFs {
         Ok(list)
     }
 
-    /// High-level read helper (also usable directly in integration tests).
+    /// Reads up to `size` bytes starting at `offset` from the file `ino`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ENOENT` if `ino` does not exist, `EISDIR` if `ino` refers to a directory, or
+    /// `EIO` if reading the underlying backing store or host file fails.
     pub fn read_node(&self, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>, libc::c_int> {
         let Some(node) = self.inodes.get(&ino) else {
             return Err(libc::ENOENT);
@@ -726,7 +812,16 @@ impl BinwalkFs {
         }
     }
 
-    /// High-level truncate / size change helper (usable in FUSE `setattr` / `open(O_TRUNC)` and tests).
+    /// Resizes the file `ino` to `new_size` bytes and returns its updated [`FileAttr`].
+    ///
+    /// When truncating a `/raw/` slice, stages an in-memory replacement buffer that will be
+    /// padded or validated when flushed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EROFS` if the filesystem is read-only, `ENOENT` if `ino` does not exist,
+    /// `ENOSPC` if `new_size` exceeds a `/raw/` slice's fixed span, or `EACCES` if `ino` is
+    /// not a writable file.
     pub fn truncate_node(&mut self, ino: u64, new_size: u64) -> Result<FileAttr, libc::c_int> {
         if !self.is_writable() {
             return Err(libc::EROFS);
@@ -745,9 +840,7 @@ impl BinwalkFs {
                 let mut current = if let Some(staged) = self.raw_write_buffers.remove(&entry_idx) {
                     staged
                 } else {
-                    self.store
-                        .read_slice(span)
-                        .map_err(|e| e.to_errno())?
+                    self.store.read_slice(span).map_err(|e| e.to_errno())?
                 };
                 current.resize(new_len, 0);
                 self.raw_write_buffers.insert(entry_idx, current);
@@ -780,8 +873,16 @@ impl BinwalkFs {
         self.compute_attr(ino)
     }
 
-    /// High-level write helper supporting `InPlaceBounded`, `CopyOnWriteOverlay`, staged `/raw/`
-    /// replacement buffers, scratch files, and extracted file modifications.
+    /// Writes `data` at `offset` into the file `ino` and returns the number of bytes written.
+    ///
+    /// Supports direct bounded writes, staged `/raw/` replacement buffers, `/raw/` scratch
+    /// files, and writable `/extracted/` files.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EROFS` if the filesystem is read-only, `ENOENT` if `ino` does not exist,
+    /// `ENOSPC` if the write would exceed the fixed `/raw/` span, `EACCES` if the node does
+    /// not permit writing, or `EISDIR` if `ino` refers to a directory.
     pub fn write_node(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<usize, libc::c_int> {
         if !self.is_writable() {
             return Err(libc::EROFS);
@@ -853,7 +954,16 @@ impl BinwalkFs {
         }
     }
 
-    /// High-level file creation helper (supports `/extracted/` files and `/raw/` scratch files).
+    /// Creates a new regular file `name` inside `parent` and returns its [`FileAttr`].
+    ///
+    /// Supports creating files inside writable `/extracted/` directories and temporary
+    /// scratch files inside `/raw/` for atomic-save editors.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EROFS` if the filesystem is read-only, `EINVAL` if `name` is invalid,
+    /// `EEXIST` if `O_EXCL` is set and the file already exists, or `EACCES` if `parent` does
+    /// not permit file creation.
     pub fn create_node(
         &mut self,
         parent: u64,
@@ -934,7 +1044,13 @@ impl BinwalkFs {
         self.compute_attr(child_ino)
     }
 
-    /// High-level directory creation helper inside `/extracted/`.
+    /// Creates a new subdirectory `name` inside a writable `/extracted/` directory `parent`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EROFS` if the filesystem is read-only, `EINVAL` if `name` is invalid,
+    /// `EEXIST` if `name` already exists, or `EACCES` if `parent` is not a writable
+    /// `/extracted/` directory.
     pub fn mkdir_node(
         &mut self,
         parent: u64,
@@ -972,7 +1088,16 @@ impl BinwalkFs {
         self.compute_attr(child_ino)
     }
 
-    /// High-level unlink helper (supports `/extracted/` files and `/raw/` scratch files).
+    /// Removes a file or symbolic link `name` from `parent`.
+    ///
+    /// Supports removing `/raw/` scratch files and files inside writable `/extracted/`
+    /// directories, repacking the modified archive back into its parent span.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EROFS` if the filesystem is read-only, `ENOENT` if `name` does not exist,
+    /// `EISDIR` if `name` refers to a directory, `EACCES` if `name` is a fixed `/raw/` slice
+    /// or inside a read-only entry, or `ENOSPC` if repacking fails to fit.
     pub fn unlink_node(&mut self, parent: u64, name: &str) -> Result<(), libc::c_int> {
         if !self.is_writable() {
             return Err(libc::EROFS);
@@ -1022,7 +1147,13 @@ impl BinwalkFs {
         self.repack_and_sync_extracted(entry_idx)
     }
 
-    /// High-level rmdir helper inside `/extracted/`.
+    /// Removes an empty subdirectory `name` from a writable `/extracted/` directory `parent`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EROFS` if the filesystem is read-only, `ENOENT` if `name` does not exist,
+    /// `ENOTDIR` if `name` is not a directory, `ENOTEMPTY` if the directory is not empty, or
+    /// `EACCES` if `parent` is not a writable `/extracted/` directory.
     pub fn rmdir_node(&mut self, parent: u64, name: &str) -> Result<(), libc::c_int> {
         if !self.is_writable() {
             return Err(libc::EROFS);
@@ -1051,7 +1182,13 @@ impl BinwalkFs {
         self.repack_and_sync_extracted(entry_idx)
     }
 
-    /// High-level symlink creation helper inside `/extracted/`.
+    /// Creates a symbolic link `name` pointing to `link_target` inside a writable `/extracted/` directory `parent`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EROFS` if the filesystem is read-only, `EEXIST` if `name` already exists,
+    /// `EACCES` if `parent` is not a writable `/extracted/` directory, or `ENOSPC` if
+    /// repacking the updated archive exceeds its parent span.
     pub fn symlink_node(
         &mut self,
         parent: u64,
@@ -1085,7 +1222,18 @@ impl BinwalkFs {
         self.compute_attr(child_ino)
     }
 
-    /// High-level rename helper supporting both `/extracted/` file/dir moves and `/raw/` atomic-save replacements.
+    /// Renames `name` in `parent` to `newname` in `newparent`.
+    ///
+    /// Supports both moving files or directories within the same `/extracted/<entry>/`
+    /// subtree and atomic-save replacements within `/raw/` (renaming a temporary scratch file
+    /// onto an existing carved `/raw/<entry>` target).
+    ///
+    /// # Errors
+    ///
+    /// Returns `EROFS` if the filesystem is read-only, `ENOENT` if the source does not exist,
+    /// `EXDEV` if renaming across different `/extracted/` entries, `ENOSPC` if an atomic
+    /// replacement or repacked archive exceeds its fixed span, or `EACCES` if the operation
+    /// is not permitted.
     pub fn rename_node(
         &mut self,
         parent: u64,
@@ -1313,7 +1461,8 @@ impl Filesystem for BinwalkFs {
                         return;
                     }
                     if let Some(m) = mode {
-                        let _ = fs::set_permissions(&h_path, fs::Permissions::from_mode(m & 0o7777));
+                        let _ =
+                            fs::set_permissions(&h_path, fs::Permissions::from_mode(m & 0o7777));
                     }
                     if atime.is_some() || mtime.is_some() {
                         let st_a = atime
@@ -1375,8 +1524,9 @@ impl Filesystem for BinwalkFs {
         };
 
         let access_mode = flags & libc::O_ACCMODE;
-        let wants_write =
-            access_mode == libc::O_WRONLY || access_mode == libc::O_RDWR || (flags & libc::O_TRUNC) != 0;
+        let wants_write = access_mode == libc::O_WRONLY
+            || access_mode == libc::O_RDWR
+            || (flags & libc::O_TRUNC) != 0;
 
         if wants_write {
             if !self.is_writable() {

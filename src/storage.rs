@@ -1,3 +1,9 @@
+//! Bounded byte intervals, write policies, and Copy-on-Write storage for binary images.
+//!
+//! This module provides [`ByteSpan`] for representing non-empty half-open intervals `[start, end)`
+//! and [`BinaryStore`] (implemented by [`OverlayBinaryStore`]) for reading and mutating carved
+//! spans under a configured [`WritePolicy`].
+
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
@@ -5,14 +11,43 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
-/// Represents a known half-open byte interval `[start, end)` within the binary image.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+/// Represents a non-empty half-open byte interval `[start, end)` within a binary image.
+///
+/// # Examples
+///
+/// ```
+/// use fuse_binwalk::ByteSpan;
+///
+/// let span = ByteSpan::from_offset_size(0x100, 0x40).unwrap();
+/// assert_eq!(span.start, 0x100);
+/// assert_eq!(span.end, 0x140);
+/// assert_eq!(span.len(), 0x40);
+/// assert!(span.contains_range(0x110, 0x130));
+/// ```
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct ByteSpan {
+    /// Inclusive starting byte offset of the span.
     pub start: usize,
+    /// Exclusive ending byte offset of the span (`end > start`).
     pub end: usize,
 }
 
 impl ByteSpan {
+    /// Creates a new [`ByteSpan`] covering `[start, end)` if `start < end`.
+    ///
+    /// Returns [`None`] if `start >= end`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fuse_binwalk::ByteSpan;
+    ///
+    /// assert!(ByteSpan::new(10, 20).is_some());
+    /// assert!(ByteSpan::new(20, 20).is_none());
+    /// assert!(ByteSpan::new(30, 20).is_none());
+    /// ```
     pub fn new(start: usize, end: usize) -> Option<Self> {
         if start < end {
             Some(Self { start, end })
@@ -21,31 +56,49 @@ impl ByteSpan {
         }
     }
 
+    /// Creates a new [`ByteSpan`] from a starting `offset` and byte `size`.
+    ///
+    /// Returns [`None`] if `size == 0` or if `offset + size` overflows [`usize`].
     pub fn from_offset_size(offset: usize, size: usize) -> Option<Self> {
         let end = offset.checked_add(size)?;
         Self::new(offset, end)
     }
 
+    /// Returns the length of the byte span in bytes (`end - start`).
     pub fn len(&self) -> usize {
         self.end.saturating_sub(self.start)
     }
 
+    /// Returns `true` if the byte span has zero length.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Returns `true` if `self` and `other` share at least one byte.
     pub fn overlaps(&self, other: &ByteSpan) -> bool {
         self.start < other.end && other.start < self.end
     }
 
+    /// Returns `true` if the sub-interval `[start, end)` lies completely within `self`.
     pub fn contains_range(&self, start: usize, end: usize) -> bool {
         start >= self.start && end <= self.end && start <= end
     }
 }
 
 /// Returns the default smart padding byte for a given Binwalk signature name.
-/// Text-based formats use ASCII space (`0x20`) so trailing padding stays valid,
-/// while binary formats use `0x00`.
+///
+/// Text-oriented formats (such as `"svg"`, `"xml"`, `"html"`, `"json"`, and PEM keys) use
+/// ASCII space (`b' '`, `0x20`) so trailing padding remains valid markup, whereas binary
+/// formats use `0x00`.
+///
+/// # Examples
+///
+/// ```
+/// use fuse_binwalk::smart_pad_byte;
+///
+/// assert_eq!(smart_pad_byte("svg"), b' ');
+/// assert_eq!(smart_pad_byte("png"), 0x00);
+/// ```
 pub fn smart_pad_byte(signature_name: &str) -> u8 {
     match signature_name {
         "svg"
@@ -65,66 +118,79 @@ pub fn smart_pad_byte(signature_name: &str) -> u8 {
     }
 }
 
-/// Defines how write operations are handled by the underlying storage engine.
-///
-/// The initial milestone uses `WritePolicy::ReadOnly`, while the storage architecture
-/// natively supports bounded in-place writes, region replacement (for repacking `/extracted/`),
-/// and copy-on-write overlays with explicit commit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Configures how write operations are handled by a [`BinaryStore`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WritePolicy {
-    /// Rejects all modifications with `EROFS`.
+    /// Rejects all modifications with [`StorageError::ReadOnly`] (`EROFS`).
+    #[default]
     ReadOnly,
-    /// Allows writes to a `ByteSpan` as long as they stay within `[span.start, span.end)`.
-    /// When replacing an entire span (e.g., repacking an extracted archive), if the new payload
-    /// is smaller than `span.len()`, the remainder is filled with `pad_byte` (if specified).
+    /// Allows writes to a [`ByteSpan`] as long as they stay within `[span.start, span.end)`.
+    ///
+    /// When replacing an entire span via [`BinaryStore::replace_span`], payloads smaller than
+    /// `span.len()` are padded with `pad_byte` (if [`Some`]) or a caller-provided fallback pad byte.
     InPlaceBounded {
+        /// Optional explicit byte value used to pad shorter span replacements.
         pad_byte: Option<u8>,
+        /// Whether writes are immediately flushed to the backing file on disk.
         write_through: bool,
     },
     /// Buffers all bounded modifications in a Copy-on-Write memory overlay without modifying
-    /// the backing file until `commit()` is explicitly invoked.
+    /// the backing file until [`BinaryStore::commit`] is invoked.
     CopyOnWriteOverlay {
+        /// Optional explicit byte value used to pad shorter span replacements.
         pad_byte: Option<u8>,
     },
 }
 
-impl Default for WritePolicy {
-    fn default() -> Self {
-        Self::ReadOnly
-    }
-}
-
+/// Errors returned by [`BinaryStore`] read, write, span replacement, and commit operations.
 #[derive(Debug, Error)]
 pub enum StorageError {
+    /// The storage engine is configured with [`WritePolicy::ReadOnly`].
     #[error("filesystem is mounted read-only")]
     ReadOnly,
+    /// A partial write exceeded the end boundary of the target [`ByteSpan`].
     #[error("write at offset {offset} of length {len} exceeds span bounds [0..{span_len})")]
     OutOfSpanBounds {
+        /// Relative offset within the span where the write started.
         offset: usize,
+        /// Number of bytes attempted to write.
         len: usize,
+        /// Total length of the target span.
         span_len: usize,
     },
+    /// A full-span replacement payload is larger than the target [`ByteSpan`].
     #[error("replacement payload ({new_len} bytes) cannot fit in span ({span_len} bytes)")]
     ReplacementTooLarge {
+        /// Byte length of the new replacement payload.
         new_len: usize,
+        /// Maximum capacity of the target span.
         span_len: usize,
     },
+    /// A full-span replacement payload is smaller than the target [`ByteSpan`] and padding is disabled.
     #[error("replacement payload ({new_len} bytes) is smaller than span ({span_len} bytes) and no padding byte is configured")]
     ReplacementUnderflow {
+        /// Byte length of the new replacement payload.
         new_len: usize,
+        /// Required byte length of the target span.
         span_len: usize,
     },
+    /// The requested [`ByteSpan`] extends past the end of the binary image.
     #[error("span [{start:#x}..{end:#x}) exceeds backing binary size ({total_len:#x})")]
     SpanOutOfRange {
+        /// Inclusive start offset of the invalid span.
         start: usize,
+        /// Exclusive end offset of the invalid span.
         end: usize,
+        /// Total byte length of the binary image.
         total_len: usize,
     },
+    /// An underlying filesystem I/O error occurred.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
 
 impl StorageError {
+    /// Maps this [`StorageError`] to its corresponding POSIX `errno` constant (`libc::c_int`).
     pub fn to_errno(&self) -> libc::c_int {
         match self {
             StorageError::ReadOnly => libc::EROFS,
@@ -137,21 +203,31 @@ impl StorageError {
     }
 }
 
-/// Abstract storage trait for reading and mutating binary spans.
+/// Abstract storage interface for reading and mutating bounded binary spans.
 pub trait BinaryStore: Send + Sync {
-    /// Total byte length of the binary image.
+    /// Returns the total byte length of the binary image.
     fn total_len(&self) -> usize;
 
-    /// Path to the original binary on disk, if backed by a file.
+    /// Returns the path to the backing binary file on disk, if backed by a file.
     fn backing_path(&self) -> Option<&Path>;
 
-    /// Current write policy.
+    /// Returns the active [`WritePolicy`] for this store.
     fn write_policy(&self) -> WritePolicy;
 
-    /// Read bytes from absolute offset in the binary into `buf`. Returns number of bytes read.
+    /// Reads bytes starting at absolute `offset` in the binary into `buf`.
+    ///
+    /// Returns the number of bytes read (`0` if `offset >= self.total_len()`).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StorageError`] if an underlying read failure occurs.
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize, StorageError>;
 
-    /// Read bytes from a specific `ByteSpan` at `offset_in_span` into `buf`.
+    /// Reads bytes from `span` starting at relative offset `offset_in_span` into `buf`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::SpanOutOfRange`] if `span.end > self.total_len()`.
     fn read_in_span(
         &self,
         span: ByteSpan,
@@ -172,7 +248,11 @@ pub trait BinaryStore: Send + Sync {
         self.read_at(span.start + offset_in_span, &mut buf[..max_read])
     }
 
-    /// Convenience helper to read an entire `ByteSpan` into a `Vec<u8>`.
+    /// Reads the entire contents of `span` into a newly allocated `Vec<u8>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::SpanOutOfRange`] if `span.end > self.total_len()`.
     fn read_slice(&self, span: ByteSpan) -> Result<Vec<u8>, StorageError> {
         if span.end > self.total_len() {
             return Err(StorageError::SpanOutOfRange {
@@ -187,8 +267,14 @@ pub trait BinaryStore: Send + Sync {
         Ok(buf)
     }
 
-    /// Write `data` into `span` at relative offset `offset_in_span`.
-    /// Enforces `WritePolicy` and ensures writes never cross `span.end`.
+    /// Writes `data` into `span` at relative offset `offset_in_span`.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`StorageError::ReadOnly`] if the policy is [`WritePolicy::ReadOnly`].
+    /// - Returns [`StorageError::OutOfSpanBounds`] if `offset_in_span + data.len() > span.len()`.
+    /// - Returns [`StorageError::SpanOutOfRange`] if `span.end > self.total_len()`.
+    /// - Returns [`StorageError::Io`] if write-through to the backing file fails.
     fn write_in_span(
         &self,
         span: ByteSpan,
@@ -196,14 +282,27 @@ pub trait BinaryStore: Send + Sync {
         data: &[u8],
     ) -> Result<usize, StorageError>;
 
-    /// Atomically replace the contents of `span` with `new_blob` (e.g., after repacking `/extracted/`).
-    /// Checks size constraints and applies padding if configured in `WritePolicy`.
+    /// Replaces the entire contents of `span` with `new_blob` using the policy's configured padding.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`StorageError::ReadOnly`] if the policy is [`WritePolicy::ReadOnly`].
+    /// - Returns [`StorageError::ReplacementTooLarge`] if `new_blob.len() > span.len()`.
+    /// - Returns [`StorageError::ReplacementUnderflow`] if `new_blob.len() < span.len()` and no
+    ///   `pad_byte` is configured in the [`WritePolicy`].
     fn replace_span(&self, span: ByteSpan, new_blob: &[u8]) -> Result<(), StorageError> {
         self.replace_span_with_fallback_pad(span, new_blob, None)
     }
 
-    /// Atomically replace the contents of `span` with `new_blob`, using the policy's configured
-    /// `pad_byte` if present, or `fallback_pad` (such as smart signature padding) otherwise.
+    /// Replaces the contents of `span` with `new_blob`, using the policy's `pad_byte` if set,
+    /// or `fallback_pad` (such as [`smart_pad_byte`]) when `new_blob.len() < span.len()`.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`StorageError::ReadOnly`] if the policy is [`WritePolicy::ReadOnly`].
+    /// - Returns [`StorageError::ReplacementTooLarge`] if `new_blob.len() > span.len()`.
+    /// - Returns [`StorageError::ReplacementUnderflow`] if `new_blob.len() < span.len()` and both
+    ///   the policy's `pad_byte` and `fallback_pad` are [`None`].
     fn replace_span_with_fallback_pad(
         &self,
         span: ByteSpan,
@@ -211,25 +310,50 @@ pub trait BinaryStore: Send + Sync {
         fallback_pad: Option<u8>,
     ) -> Result<(), StorageError>;
 
-    /// Returns true if the CoW overlay holds uncommitted modifications.
+    /// Returns `true` if the Copy-on-Write overlay holds modifications not yet committed.
     fn is_dirty(&self) -> bool;
 
-    /// Flushes any buffered Copy-on-Write modifications back to the underlying file on disk.
+    /// Flushes buffered Copy-on-Write modifications back to the backing file on disk.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`StorageError::ReadOnly`] if the policy is [`WritePolicy::ReadOnly`].
+    /// - Returns [`StorageError::Io`] if writing to the backing file fails.
     fn commit(&self) -> Result<(), StorageError>;
 }
 
-/// Concrete storage implementation supporting zero-overhead immutable reads as well as
-/// Copy-on-Write (CoW) byte-range overlays and bounded write-through.
+/// Thread-safe [`BinaryStore`] implementation supporting zero-overhead immutable reads,
+/// Copy-on-Write byte-range overlays, and bounded write-through.
+///
+/// # Examples
+///
+/// ```
+/// use fuse_binwalk::{BinaryStore, ByteSpan, OverlayBinaryStore, WritePolicy};
+///
+/// let store = OverlayBinaryStore::from_bytes(
+///     vec![10, 20, 30, 40, 50],
+///     None,
+///     WritePolicy::CopyOnWriteOverlay { pad_byte: Some(0xFF) },
+/// );
+/// let span = ByteSpan::new(1, 4).unwrap();
+/// store.replace_span(span, &[99])?;
+/// assert_eq!(store.read_slice(span)?, vec![99, 0xFF, 0xFF]);
+/// # Ok::<(), fuse_binwalk::StorageError>(())
+/// ```
 pub struct OverlayBinaryStore {
     backing_path: Option<PathBuf>,
     base_data: Arc<Vec<u8>>,
     policy: WritePolicy,
-    /// CoW overlay mapping absolute byte offset -> modified byte value (or contiguous chunks).
-    /// Using chunked segments keyed by start offset for efficient range reads/writes.
+    /// Chunked CoW overlay keyed by absolute starting byte offset.
     overlay: RwLock<BTreeMap<usize, Vec<u8>>>,
 }
 
 impl OverlayBinaryStore {
+    /// Loads a binary file from `path` into memory with the specified [`WritePolicy`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Io`] if `path` cannot be read.
     pub fn from_file(path: impl AsRef<Path>, policy: WritePolicy) -> Result<Self, StorageError> {
         let path_buf = path.as_ref().to_path_buf();
         let data = std::fs::read(&path_buf)?;
@@ -241,11 +365,8 @@ impl OverlayBinaryStore {
         })
     }
 
-    pub fn from_bytes(
-        data: Vec<u8>,
-        backing_path: Option<PathBuf>,
-        policy: WritePolicy,
-    ) -> Self {
+    /// Creates an [`OverlayBinaryStore`] from an in-memory byte vector `data` and optional `backing_path`.
+    pub fn from_bytes(data: Vec<u8>, backing_path: Option<PathBuf>, policy: WritePolicy) -> Self {
         Self {
             backing_path,
             base_data: Arc::new(data),
@@ -254,7 +375,7 @@ impl OverlayBinaryStore {
         }
     }
 
-    /// Access the raw underlying immutable base buffer (fast path when `!is_dirty()`).
+    /// Returns a slice of the original unmodified base binary image.
     pub fn base_bytes(&self) -> &[u8] {
         &self.base_data
     }
@@ -264,8 +385,6 @@ impl OverlayBinaryStore {
             return;
         }
         let mut map = self.overlay.write().expect("overlay lock poisoned");
-        // To keep the overlay simple and exact even with arbitrary overlapping writes,
-        // coalesce or split existing chunks that overlap [abs_offset, abs_offset + data.len()).
         let write_start = abs_offset;
         let write_end = abs_offset + data.len();
 
@@ -381,13 +500,14 @@ impl BinaryStore for OverlayBinaryStore {
             WritePolicy::CopyOnWriteOverlay { .. } => false,
         };
 
-        let end_in_span = offset_in_span
-            .checked_add(data.len())
-            .ok_or(StorageError::OutOfSpanBounds {
-                offset: offset_in_span,
-                len: data.len(),
-                span_len: span.len(),
-            })?;
+        let end_in_span =
+            offset_in_span
+                .checked_add(data.len())
+                .ok_or(StorageError::OutOfSpanBounds {
+                    offset: offset_in_span,
+                    len: data.len(),
+                    span_len: span.len(),
+                })?;
 
         if end_in_span > span.len() {
             return Err(StorageError::OutOfSpanBounds {
@@ -463,7 +583,11 @@ impl BinaryStore for OverlayBinaryStore {
     }
 
     fn is_dirty(&self) -> bool {
-        !self.overlay.read().expect("overlay lock poisoned").is_empty()
+        !self
+            .overlay
+            .read()
+            .expect("overlay lock poisoned")
+            .is_empty()
     }
 
     fn commit(&self) -> Result<(), StorageError> {
@@ -493,7 +617,8 @@ mod tests {
 
     #[test]
     fn test_read_only_rejects_writes() {
-        let store = OverlayBinaryStore::from_bytes(vec![0, 1, 2, 3, 4, 5], None, WritePolicy::ReadOnly);
+        let store =
+            OverlayBinaryStore::from_bytes(vec![0, 1, 2, 3, 4, 5], None, WritePolicy::ReadOnly);
         let span = ByteSpan::new(1, 4).unwrap();
         assert_eq!(store.read_slice(span).unwrap(), vec![1, 2, 3]);
         assert!(matches!(
@@ -507,7 +632,9 @@ mod tests {
         let store = OverlayBinaryStore::from_bytes(
             vec![10, 20, 30, 40, 50, 60],
             None,
-            WritePolicy::CopyOnWriteOverlay { pad_byte: Some(0xFF) },
+            WritePolicy::CopyOnWriteOverlay {
+                pad_byte: Some(0xFF),
+            },
         );
         let span = ByteSpan::new(1, 5).unwrap();
         assert_eq!(store.write_in_span(span, 1, &[99, 88]).unwrap(), 2);

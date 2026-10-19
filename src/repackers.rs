@@ -1,3 +1,11 @@
+//! Built-in [`RegionRepacker`] implementations and parent container checksum synchronization.
+//!
+//! This module provides pure-Rust repackers for `"zip"`, `"tar"` / `"tarball"`, `"gzip"`,
+//! `"zlib"`, `"bzip2"`, `"xz"`, `"lzma"`, and `"cpio"`, as well as host-tool-backed repackers
+//! for `"zstd"`, `"lz4"`, and `"squashfs"`. It also provides [`sync_parent_zip_crc32_for_span`]
+//! for keeping outer ZIP container headers consistent when nested uncompressed `/raw/` slices
+//! are modified directly.
+
 use crate::extractor::{RegionRepacker, RepackerRegistry};
 use crate::scanner::CarvedEntry;
 use crate::storage::{BinaryStore, ByteSpan};
@@ -17,6 +25,18 @@ use xz2::stream::{LzmaOptions, Stream};
 use xz2::write::XzEncoder;
 
 /// Registers all built-in container and compression repackers into `registry`.
+///
+/// # Examples
+///
+/// ```
+/// use fuse_binwalk::RepackerRegistry;
+/// use fuse_binwalk::repackers::register_builtin_repackers;
+///
+/// let registry = RepackerRegistry::new();
+/// register_builtin_repackers(&registry);
+/// assert!(registry.can_repack("zip"));
+/// assert!(registry.can_repack("tarball"));
+/// ```
 pub fn register_builtin_repackers(registry: &RepackerRegistry) {
     registry.register(Arc::new(ZipRepacker));
     registry.register(Arc::new(TarRepacker::new("tar")));
@@ -32,7 +52,7 @@ pub fn register_builtin_repackers(registry: &RepackerRegistry) {
     registry.register(Arc::new(SquashfsRepacker));
 }
 
-/// Checks if a binary executable exists in the current `PATH`.
+/// Returns `true` if an executable named `binary_name` exists in the current `PATH`.
 pub fn command_exists_in_path(binary_name: &str) -> bool {
     if binary_name.contains('/') {
         return Path::new(binary_name).is_file();
@@ -46,7 +66,7 @@ pub fn command_exists_in_path(binary_name: &str) -> bool {
     })
 }
 
-/// Collects regular files, directories, and symlinks inside `dir` (excluding `_extraction_status.txt`)
+/// Collects regular files, directories, and symlinks inside `root` (excluding `_extraction_status.txt`)
 /// in deterministic lexicographical order of relative paths.
 fn collect_extracted_entries(root: &Path) -> Result<Vec<(String, PathBuf)>> {
     let mut items = Vec::new();
@@ -73,9 +93,8 @@ fn collect_extracted_entries(root: &Path) -> Result<Vec<(String, PathBuf)>> {
     Ok(items)
 }
 
-/// Helper: If `extracted_dir` contains_only one regular file (and no subdirectories),
-/// returns the bytes of that single file. Otherwise packs `extracted_dir` into a TAR archive
-/// and returns the TAR bytes.
+/// Returns the raw file bytes if `extracted_dir` contains a single regular file, or packs
+/// `extracted_dir` into a TAR archive otherwise.
 fn read_single_file_or_tar(extracted_dir: &Path) -> Result<Vec<u8>> {
     let items = collect_extracted_entries(extracted_dir)?;
     let regular_files: Vec<&PathBuf> = items
@@ -95,7 +114,11 @@ fn read_single_file_or_tar(extracted_dir: &Path) -> Result<Vec<u8>> {
     }
 }
 
-/// Packs `extracted_dir` into a deterministic uncompressed TAR byte buffer.
+/// Packs `extracted_dir` into a deterministic uncompressed TAR archive buffer.
+///
+/// # Errors
+///
+/// Returns an error if walking `extracted_dir` or serializing TAR headers fails.
 pub fn pack_directory_to_tar(extracted_dir: &Path) -> Result<Vec<u8>> {
     let mut tar_buf = Vec::new();
     {
@@ -116,11 +139,13 @@ pub fn pack_directory_to_tar(extracted_dir: &Path) -> Result<Vec<u8>> {
 // 1. TAR Repacker
 // ============================================================================
 
+/// Pure-Rust [`RegionRepacker`] for POSIX/GNU TAR archives (`"tar"` and `"tarball"`).
 pub struct TarRepacker {
     sig_name: &'static str,
 }
 
 impl TarRepacker {
+    /// Creates a new [`TarRepacker`] registered for `sig_name`.
     pub fn new(sig_name: &'static str) -> Self {
         Self { sig_name }
     }
@@ -140,6 +165,7 @@ impl RegionRepacker for TarRepacker {
 // 2. GZIP Repacker
 // ============================================================================
 
+/// Pure-Rust [`RegionRepacker`] for `"gzip"` streams.
 pub struct GzipRepacker;
 
 impl RegionRepacker for GzipRepacker {
@@ -159,6 +185,7 @@ impl RegionRepacker for GzipRepacker {
 // 3. ZLIB Repacker
 // ============================================================================
 
+/// Pure-Rust [`RegionRepacker`] for `"zlib"` streams.
 pub struct ZlibRepacker;
 
 impl RegionRepacker for ZlibRepacker {
@@ -178,6 +205,7 @@ impl RegionRepacker for ZlibRepacker {
 // 4. BZIP2 Repacker
 // ============================================================================
 
+/// Pure-Rust [`RegionRepacker`] for `"bzip2"` streams.
 pub struct Bzip2Repacker;
 
 impl RegionRepacker for Bzip2Repacker {
@@ -197,12 +225,14 @@ impl RegionRepacker for Bzip2Repacker {
 // 5. XZ / LZMA Repacker
 // ============================================================================
 
+/// [`RegionRepacker`] for `"xz"` and `"lzma"` compressed streams backed by `liblzma`.
 pub struct XzRepacker {
     sig_name: &'static str,
     is_lzma: bool,
 }
 
 impl XzRepacker {
+    /// Creates an [`XzRepacker`] configured for `"xz"` streams.
     pub fn new_xz() -> Self {
         Self {
             sig_name: "xz",
@@ -210,6 +240,7 @@ impl XzRepacker {
         }
     }
 
+    /// Creates an [`XzRepacker`] configured for legacy `"lzma"` streams.
     pub fn new_lzma() -> Self {
         Self {
             sig_name: "lzma",
@@ -243,6 +274,7 @@ impl RegionRepacker for XzRepacker {
 // 6. CPIO (SVR4 newc 070701) Repacker
 // ============================================================================
 
+/// Pure-Rust [`RegionRepacker`] for SVR4 `newc` (`070701`) `"cpio"` archives.
 pub struct CpioRepacker;
 
 impl RegionRepacker for CpioRepacker {
@@ -335,6 +367,7 @@ fn write_cpio_newc_entry(
 // 7. External Command Repackers (zstd, lz4, squashfs)
 // ============================================================================
 
+/// [`RegionRepacker`] that pipes extracted data through a host compressor executable (`zstd` or `lz4`).
 pub struct ExternalCommandRepacker {
     sig_name: &'static str,
     binary: &'static str,
@@ -342,6 +375,7 @@ pub struct ExternalCommandRepacker {
 }
 
 impl ExternalCommandRepacker {
+    /// Creates an [`ExternalCommandRepacker`] for `"zstd"` streams using the `zstd` CLI utility.
     pub fn new_zstd() -> Self {
         Self {
             sig_name: "zstd",
@@ -350,6 +384,7 @@ impl ExternalCommandRepacker {
         }
     }
 
+    /// Creates an [`ExternalCommandRepacker`] for `"lz4"` streams using the `lz4` CLI utility.
     pub fn new_lz4() -> Self {
         Self {
             sig_name: "lz4",
@@ -393,6 +428,7 @@ impl RegionRepacker for ExternalCommandRepacker {
     }
 }
 
+/// [`RegionRepacker`] for `"squashfs"` filesystem images backed by `mksquashfs`.
 pub struct SquashfsRepacker;
 
 impl RegionRepacker for SquashfsRepacker {
@@ -470,15 +506,21 @@ fn parse_existing_zip(zip_bytes: &[u8]) -> Option<Vec<ParsedZipEntry>> {
         }
     }
     let eocd_offset = eocd_pos?;
-    let total_entries =
-        u16::from_le_bytes(zip_bytes[eocd_offset + 10..eocd_offset + 12].try_into().ok()?)
-            as usize;
-    let cd_size =
-        u32::from_le_bytes(zip_bytes[eocd_offset + 12..eocd_offset + 16].try_into().ok()?)
-            as usize;
-    let cd_offset_raw =
-        u32::from_le_bytes(zip_bytes[eocd_offset + 16..eocd_offset + 20].try_into().ok()?)
-            as usize;
+    let total_entries = u16::from_le_bytes(
+        zip_bytes[eocd_offset + 10..eocd_offset + 12]
+            .try_into()
+            .ok()?,
+    ) as usize;
+    let cd_size = u32::from_le_bytes(
+        zip_bytes[eocd_offset + 12..eocd_offset + 16]
+            .try_into()
+            .ok()?,
+    ) as usize;
+    let cd_offset_raw = u32::from_le_bytes(
+        zip_bytes[eocd_offset + 16..eocd_offset + 20]
+            .try_into()
+            .ok()?,
+    ) as usize;
 
     // Note: If the ZIP was carved starting at the first LFH (`0x00097FAA` in omni.ja),
     // `cd_offset_raw` in EOCD might be relative to the start of the whole binary rather than
@@ -515,8 +557,7 @@ fn parse_existing_zip(zip_bytes: &[u8]) -> Option<Vec<ParsedZipEntry>> {
                 let name =
                     String::from_utf8_lossy(&zip_bytes[scan_pos + 30..scan_pos + 30 + name_len])
                         .to_string();
-                let lfh_extra =
-                    zip_bytes[scan_pos + 30 + name_len..data_start].to_vec();
+                let lfh_extra = zip_bytes[scan_pos + 30 + name_len..data_start].to_vec();
                 lfh_by_offset.insert(scan_pos, (flags, lfh_extra.clone(), data_start));
                 lfh_by_name
                     .entry(name)
@@ -541,10 +582,8 @@ fn parse_existing_zip(zip_bytes: &[u8]) -> Option<Vec<ParsedZipEntry>> {
         let crc32 = u32::from_le_bytes(zip_bytes[pos + 16..pos + 20].try_into().ok()?);
         let comp_size = u32::from_le_bytes(zip_bytes[pos + 20..pos + 24].try_into().ok()?);
         let uncomp_size = u32::from_le_bytes(zip_bytes[pos + 24..pos + 28].try_into().ok()?);
-        let name_len =
-            u16::from_le_bytes(zip_bytes[pos + 28..pos + 30].try_into().ok()?) as usize;
-        let extra_len =
-            u16::from_le_bytes(zip_bytes[pos + 30..pos + 32].try_into().ok()?) as usize;
+        let name_len = u16::from_le_bytes(zip_bytes[pos + 28..pos + 30].try_into().ok()?) as usize;
+        let extra_len = u16::from_le_bytes(zip_bytes[pos + 30..pos + 32].try_into().ok()?) as usize;
         let comment_len =
             u16::from_le_bytes(zip_bytes[pos + 32..pos + 34].try_into().ok()?) as usize;
         let internal_attr = u16::from_le_bytes(zip_bytes[pos + 36..pos + 38].try_into().ok()?);
@@ -558,19 +597,15 @@ fn parse_existing_zip(zip_bytes: &[u8]) -> Option<Vec<ParsedZipEntry>> {
         }
         let name = String::from_utf8_lossy(&zip_bytes[pos + 46..pos + 46 + name_len]).to_string();
         let cdh_extra = zip_bytes[pos + 46 + name_len..pos + 46 + name_len + extra_len].to_vec();
-        let comment =
-            zip_bytes[pos + 46 + name_len + extra_len..cdh_end].to_vec();
+        let comment = zip_bytes[pos + 46 + name_len + extra_len..cdh_end].to_vec();
 
         // Find matching LFH
-        let lfh_match = lfh_by_offset
-            .get(&lfh_offset_raw)
-            .cloned()
-            .or_else(|| {
-                lfh_by_name
-                    .get(&name)
-                    .and_then(|list| list.first())
-                    .map(|(_, f, ex, ds)| (*f, ex.clone(), *ds))
-            })?;
+        let lfh_match = lfh_by_offset.get(&lfh_offset_raw).cloned().or_else(|| {
+            lfh_by_name
+                .get(&name)
+                .and_then(|list| list.first())
+                .map(|(_, f, ex, ds)| (*f, ex.clone(), *ds))
+        })?;
 
         let (_lfh_flags, lfh_extra, data_start) = lfh_match;
         let data_end = data_start.checked_add(comp_size as usize)?;
@@ -608,6 +643,11 @@ fn parse_existing_zip(zip_bytes: &[u8]) -> Option<Vec<ParsedZipEntry>> {
     }
 }
 
+/// Delta-aware pure-Rust [`RegionRepacker`] for `"zip"` archives.
+///
+/// When repacking with a [`BinaryStore`] reference, [`ZipRepacker`] parses the original ZIP
+/// slice and preserves unmodified entries' exact compressed byte streams, compression methods,
+/// extra fields, and entry ordering while re-encoding only modified or newly added files.
 pub struct ZipRepacker;
 
 impl RegionRepacker for ZipRepacker {
@@ -792,10 +832,19 @@ fn serialize_zip_entries(entries: &[ParsedZipEntry]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Inspects the binary in `store` to see if `modified_span` lies inside an uncompressed (`STORE`,
-/// method 0) entry of any ZIP archive (including standard ZIPs and Firefox `omni.ja`).
-/// If so, recomputes the CRC32 of the enclosing ZIP member and updates both its Local File Header
-/// (`PK\x03\x04`) and Central Directory Header (`PK\x01\x02`) in `store`.
+/// Recomputes and patches enclosing ZIP CRC32 checksums when a nested `/raw/` slice is modified.
+///
+/// Inspects `store` to determine whether `modified_span` lies inside an uncompressed (`STORE`,
+/// method `0`) member of any discovered `"zip"` archive (including standard ZIP archives and
+/// optimized JAR containers such as Firefox's `omni.ja`). When a match is found, this function
+/// recomputes the member's CRC32 and updates both its Local File Header (`PK\x03\x04` at `+14`)
+/// and Central Directory Header (`PK\x01\x02` at `+16`).
+///
+/// Returns the number of enclosing ZIP entries whose CRC32 headers were updated.
+///
+/// # Errors
+///
+/// Returns an error if reading or writing the ZIP header bytes in `store` fails.
 pub fn sync_parent_zip_crc32_for_span(
     modified_span: ByteSpan,
     entries: &[CarvedEntry],

@@ -1,3 +1,10 @@
+//! Signature scanning, boundary validation, and manifest generation using Binwalk v3.
+//!
+//! This module drives Binwalk v3's signature table and parsers across a binary image,
+//! filtering for signatures with known start and end byte offsets (`size > 0` and
+//! `offset + size <= file_data.len()`) and producing [`CarvedEntry`] records and
+//! [`ManifestDocument`] summaries.
+
 use crate::storage::ByteSpan;
 use aho_corasick::AhoCorasick;
 use anyhow::{anyhow, Result};
@@ -9,15 +16,32 @@ use binwalk::Binwalk;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, Serialize, Deserialize)]
+/// Represents the minimum or reported confidence tier for a Binwalk signature match.
+///
+/// # Examples
+///
+/// ```
+/// use fuse_binwalk::ConfidenceLevel;
+///
+/// let level = ConfidenceLevel::from_binwalk_u8(250);
+/// assert_eq!(level, ConfidenceLevel::High);
+/// assert!(level.to_binwalk_u8() >= ConfidenceLevel::Medium.to_binwalk_u8());
+/// ```
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, Serialize, Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum ConfidenceLevel {
+    /// Low confidence threshold (`CONFIDENCE_LOW`).
     Low,
+    /// Medium confidence threshold (`CONFIDENCE_MEDIUM`).
     Medium,
+    /// High confidence threshold (`CONFIDENCE_HIGH`).
     High,
 }
 
 impl ConfidenceLevel {
+    /// Converts this [`ConfidenceLevel`] into Binwalk's raw `u8` confidence constant.
     pub fn to_binwalk_u8(self) -> u8 {
         match self {
             ConfidenceLevel::Low => CONFIDENCE_LOW,
@@ -26,6 +50,7 @@ impl ConfidenceLevel {
         }
     }
 
+    /// Maps a raw Binwalk `u8` confidence score to its corresponding [`ConfidenceLevel`].
     pub fn from_binwalk_u8(val: u8) -> Self {
         if val >= CONFIDENCE_HIGH {
             ConfidenceLevel::High
@@ -37,67 +62,113 @@ impl ConfidenceLevel {
     }
 }
 
+/// Configures signature filtering and search behavior for [`scan_bounded_signatures`].
 #[derive(Debug, Clone, Default)]
 pub struct ScanConfig {
+    /// Minimum confidence level required for a signature to be included.
     pub min_confidence: Option<ConfidenceLevel>,
+    /// Optional allow-list of Binwalk signature names to scan for.
     pub include: Option<Vec<String>>,
+    /// Optional deny-list of Binwalk signature names to exclude.
     pub exclude: Option<Vec<String>>,
+    /// Whether short signatures should be searched across the entire binary instead of only offset `0`.
     pub full_search: bool,
 }
 
-/// A validated signature region in the binary with known start and end byte offsets.
+/// Represents a validated signature region in the binary with known start and end byte offsets.
 #[derive(Debug, Clone)]
 pub struct CarvedEntry {
-    /// Index in the catalog (0-based).
+    /// Zero-based index of this entry in the discovered catalog.
     pub index: usize,
-    /// Known half-open byte range `[start, end)` in the binary.
+    /// Half-open byte range `[start, end)` in the binary.
     pub span: ByteSpan,
-    /// Filename under `/raw/`, e.g., `0x00001000_0x00002400_squashfs.sqsh`
+    /// Virtual filename exposed under `/raw/` (for example, `0x00001000_0x00002400_squashfs.sqsh`).
     pub raw_filename: String,
-    /// Directory name under `/extracted/` (if `has_extractor` is true), e.g., `0x00001000_0x00002400_squashfs`
+    /// Directory name exposed under `/extracted/` when [`Self::has_extractor`] is `true`.
     pub extracted_dirname: String,
-    /// Underlying Binwalk `SignatureResult` (populated with `id`, `name`, `offset`, `size`, etc.).
+    /// Underlying Binwalk [`SignatureResult`] containing the signature's name, description, and metadata.
     pub signature_result: SignatureResult,
-    /// Associated Binwalk `Extractor` (if this signature supports extraction and did not decline it).
+    /// Associated Binwalk [`Extractor`] when the signature supports container or stream extraction.
     pub extractor: Option<Extractor>,
 }
 
 impl CarvedEntry {
+    /// Returns `true` if this entry has an associated container or stream extractor for `/extracted/`.
     pub fn has_extractor(&self) -> bool {
         self.extractor.is_some()
     }
 }
 
-/// Serializable manifest entry exposed in `/manifest.json`.
+/// Represents a single serializable entry inside a [`ManifestDocument`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestEntry {
+    /// Zero-based catalog index.
     pub index: usize,
+    /// Unique identifier string for the signature match.
     pub id: String,
+    /// Binwalk signature short name (such as `"zip"`, `"svg"`, or `"png"`).
     pub name: String,
+    /// Human-readable description reported by the Binwalk parser.
     pub description: String,
+    /// Categorized confidence tier.
     pub confidence: ConfidenceLevel,
+    /// Raw numeric confidence score (`0..=255`).
     pub confidence_raw: u8,
+    /// Inclusive starting byte offset.
     pub start_offset: usize,
+    /// Exclusive ending byte offset.
     pub end_offset: usize,
+    /// Formatted hexadecimal start offset (`"0x..."`).
     pub start_hex: String,
+    /// Formatted hexadecimal end offset (`"0x..."`).
     pub end_hex: String,
+    /// Total byte length of the region.
     pub size: usize,
+    /// Virtual path under `/raw/`.
     pub raw_path: String,
+    /// Virtual directory path under `/extracted/`, or [`None`] for carve-only entries.
     pub extracted_path: Option<String>,
+    /// Whether this entry is exposed under `/extracted/`.
     pub extractable: bool,
 }
 
+/// Represents the top-level JSON manifest exposed at `/manifest.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestDocument {
+    /// Total size of the underlying binary image in bytes.
     pub binary_size: usize,
+    /// Total number of bounded signatures discovered in the binary.
     pub total_bounded_entries: usize,
+    /// Number of bounded signatures that also expose an `/extracted/` directory.
     pub total_extractable_entries: usize,
+    /// Ordered list of discovered [`ManifestEntry`] records.
     pub entries: Vec<ManifestEntry>,
 }
 
 /// Scans `file_data` using Binwalk v3's signature definitions and parsers, returning all
-/// valid signatures that explicitly report a known non-zero size (`size > 0` and `offset + size <= file_data.len()`),
-/// including overlapping or nested signatures.
+/// valid signatures that report a known non-zero size (`size > 0` and `offset + size <= file_data.len()`).
+///
+/// Overlapping and nested signatures of distinct types (such as an `"svg"` or `"png"` stored inside
+/// a `"zip"` or `"tarball"` container) are preserved in the returned list, ordered by
+/// `(start_offset, end_offset, signature_name)`.
+///
+/// # Errors
+///
+/// Returns an error if Binwalk fails to initialize its signature tables or if the Aho-Corasick
+/// automaton cannot be constructed.
+///
+/// # Examples
+///
+/// ```
+/// use fuse_binwalk::{scan_bounded_signatures, ScanConfig};
+///
+/// let svg_blob = b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>";
+/// let entries = scan_bounded_signatures(svg_blob, &ScanConfig::default())?;
+/// assert_eq!(entries.len(), 1);
+/// assert_eq!(entries[0].signature_result.name, "svg");
+/// assert_eq!(entries[0].span.len(), svg_blob.len());
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 pub fn scan_bounded_signatures(file_data: &[u8], config: &ScanConfig) -> Result<Vec<CarvedEntry>> {
     let binwalker = Binwalk::configure(
         None,
@@ -195,7 +266,9 @@ pub fn scan_bounded_signatures(file_data: &[u8], config: &ScanConfig) -> Result<
                     min_conf,
                 ) {
                     let sig_end = sig_result.offset.saturating_add(sig_result.size);
-                    let prev_end = active_end_by_sig.entry(sig_result.name.clone()).or_insert(0);
+                    let prev_end = active_end_by_sig
+                        .entry(sig_result.name.clone())
+                        .or_insert(0);
                     if sig_end > *prev_end {
                         *prev_end = sig_end;
                     }
@@ -345,15 +418,27 @@ fn infer_elf_size(slice: &[u8]) -> Option<usize> {
 
     let read_u16 = |off: usize| -> Option<u16> {
         let b: [u8; 2] = slice.get(off..off + 2)?.try_into().ok()?;
-        Some(if is_le { u16::from_le_bytes(b) } else { u16::from_be_bytes(b) })
+        Some(if is_le {
+            u16::from_le_bytes(b)
+        } else {
+            u16::from_be_bytes(b)
+        })
     };
     let read_u32 = |off: usize| -> Option<u32> {
         let b: [u8; 4] = slice.get(off..off + 4)?.try_into().ok()?;
-        Some(if is_le { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) })
+        Some(if is_le {
+            u32::from_le_bytes(b)
+        } else {
+            u32::from_be_bytes(b)
+        })
     };
     let read_u64 = |off: usize| -> Option<u64> {
         let b: [u8; 8] = slice.get(off..off + 8)?.try_into().ok()?;
-        Some(if is_le { u64::from_le_bytes(b) } else { u64::from_be_bytes(b) })
+        Some(if is_le {
+            u64::from_le_bytes(b)
+        } else {
+            u64::from_be_bytes(b)
+        })
     };
 
     const SHT_NOBITS: u32 = 8;
@@ -520,6 +605,20 @@ fn infer_extension(sig_name: &str, description: &str, extractor: Option<&Extract
     "bin".to_string()
 }
 
+/// Builds a serializable [`ManifestDocument`] from the discovered [`CarvedEntry`] slice.
+///
+/// # Examples
+///
+/// ```
+/// use fuse_binwalk::{build_manifest, scan_bounded_signatures, ScanConfig};
+///
+/// let data = b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>";
+/// let entries = scan_bounded_signatures(data, &ScanConfig::default())?;
+/// let manifest = build_manifest(data.len(), &entries);
+/// assert_eq!(manifest.binary_size, data.len());
+/// assert_eq!(manifest.total_bounded_entries, 1);
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 pub fn build_manifest(binary_size: usize, entries: &[CarvedEntry]) -> ManifestDocument {
     let mut extractable_count = 0;
     let manifest_entries = entries

@@ -1,3 +1,5 @@
+//! Command-line entry point for mounting binary images with `fuse-binwalk`.
+
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use fuse_binwalk::{
@@ -10,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::channel;
 use std::sync::Arc;
 
+/// Parses a single padding byte from a hexadecimal (`0x20`), single-character, or decimal string.
 fn parse_pad_byte(s: &str) -> Result<u8, String> {
     let trimmed = s.trim();
     if let Some(hex) = trimmed
@@ -26,6 +29,7 @@ fn parse_pad_byte(s: &str) -> Result<u8, String> {
     }
 }
 
+/// Command-line arguments for the `fuse-binwalk` executable.
 #[derive(Debug, Parser)]
 #[command(
     name = "fuse-binwalk",
@@ -33,56 +37,57 @@ fn parse_pad_byte(s: &str) -> Result<u8, String> {
     about = "Mount any arbitrary binary as a FUSE filesystem using Binwalk v3"
 )]
 struct Cli {
-    /// Path to the binary image to analyze and mount
+    /// Path to the binary image to analyze and mount.
     #[arg(value_name = "BINARY_PATH")]
     binary_path: PathBuf,
 
-    /// Directory where the FUSE filesystem should be mounted
+    /// Directory where the FUSE filesystem should be mounted.
     #[arg(value_name = "MOUNTPOINT")]
     mountpoint: PathBuf,
 
-    /// Enable write support (in-place write-through to the target binary unless --cow is set)
+    /// Enables write support (in-place write-through to the target binary unless `--cow` is set).
     #[arg(short = 'w', long = "writable")]
     writable: bool,
 
-    /// Clone the input binary to <OUTPUT> before mounting and write modifications there
+    /// Clones the input binary to `<PATH>` before mounting and writes modifications there.
     #[arg(short = 'o', long = "output", value_name = "PATH")]
     output: Option<PathBuf>,
 
-    /// Buffer writes in a Copy-on-Write memory overlay until fsync or clean unmount
+    /// Buffers writes in a Copy-on-Write memory overlay until `fsync` or clean unmount.
     #[arg(long)]
     cow: bool,
 
-    /// Explicit padding byte (e.g., 0x00, 0xFF, 0x20) when a replacement is smaller than its span.
-    /// Defaults to smart padding (0x20 space for text/SVG/XML/PEM, 0x00 for binary).
+    /// Explicit padding byte (e.g., `0x00`, `0xFF`, `0x20`) when a replacement is smaller than its span.
+    ///
+    /// Defaults to smart padding (`0x20` space for text/SVG/XML/PEM, `0x00` for binary).
     #[arg(long, value_parser = parse_pad_byte, value_name = "BYTE")]
     pad_byte: Option<u8>,
 
-    /// Reject replacements that are smaller than the original span unless --pad-byte is explicitly provided
+    /// Rejects replacements that are smaller than the original span unless `--pad-byte` is explicitly provided.
     #[arg(long)]
     strict_size: bool,
 
-    /// Minimum signature confidence threshold to include
+    /// Minimum signature confidence threshold to include.
     #[arg(long, value_enum, default_value_t = ConfidenceLevel::Low)]
     min_confidence: ConfidenceLevel,
 
-    /// Only scan for these Binwalk signature names (comma-separated or repeated)
+    /// Only scans for these Binwalk signature names (comma-separated or repeated).
     #[arg(long, value_delimiter = ',')]
     include: Option<Vec<String>>,
 
-    /// Exclude these Binwalk signature names from scanning (comma-separated or repeated)
+    /// Excludes these Binwalk signature names from scanning (comma-separated or repeated).
     #[arg(long, value_delimiter = ',')]
     exclude: Option<Vec<String>>,
 
-    /// Scan for short signatures throughout the entire file rather than only at offset 0
+    /// Scans for short signatures throughout the entire file rather than only at offset 0.
     #[arg(long)]
     full_search: bool,
 
-    /// Run as a background daemon instead of staying in the foreground
+    /// Runs as a background daemon instead of staying in the foreground.
     #[arg(short = 'd', long = "daemon")]
     daemon: bool,
 
-    /// Allow other users on the system to access the mounted filesystem
+    /// Allows other users on the system to access the mounted filesystem.
     #[arg(long)]
     allow_other: bool,
 }
@@ -118,8 +123,12 @@ fn main() -> Result<()> {
                 out_path.display()
             )
         })?;
-        std::fs::canonicalize(out_path)
-            .map_err(|e| anyhow!("Failed to resolve output path '{}': {e}", out_path.display()))?
+        std::fs::canonicalize(out_path).map_err(|e| {
+            anyhow!(
+                "Failed to resolve output path '{}': {e}",
+                out_path.display()
+            )
+        })?
     } else {
         source_binary_path
     };
@@ -214,7 +223,11 @@ fn main() -> Result<()> {
         "Mounting '{}' at '{}' ({}, Ctrl+C to unmount)",
         target_binary_path.display(),
         mountpoint.display(),
-        if is_writable { "read-write" } else { "read-only" }
+        if is_writable {
+            "read-write"
+        } else {
+            "read-only"
+        }
     );
 
     let session = fuser::spawn_mount2(fs, &mountpoint, &options).with_context(|| {

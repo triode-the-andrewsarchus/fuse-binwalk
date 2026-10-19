@@ -1,3 +1,10 @@
+//! On-demand bounded extraction and container repacking for `/extracted/` entries.
+//!
+//! This module provides [`ExtractionManager`] for lazily extracting [`CarvedEntry`] slices
+//! into isolated temporary directories upon first access, and [`RegionRepacker`] /
+//! [`RepackerRegistry`] for re-serializing modified extraction trees back into their
+//! parent [`ByteSpan`] in a [`BinaryStore`].
+
 use crate::scanner::CarvedEntry;
 use crate::storage::{smart_pad_byte, BinaryStore, ByteSpan, StorageError};
 use anyhow::{anyhow, Result};
@@ -8,21 +15,35 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use tempfile::TempDir;
 
-/// Trait for repacking a modified `/extracted/<entry>/` directory back into a raw binary blob
-/// so it can be written back to its parent `ByteSpan` in the `BinaryStore`.
+/// Serializes a modified `/extracted/<entry>/` directory back into a raw binary payload
+/// so it can replace its parent [`ByteSpan`] in a [`BinaryStore`].
 pub trait RegionRepacker: Send + Sync {
-    /// Signature name handled by this repacker (e.g., `"gzip"`, `"tar"`, `"squashfs"`).
+    /// Returns the Binwalk signature name handled by this repacker (such as `"zip"`, `"gzip"`, or `"tar"`).
     fn signature_name(&self) -> &str;
 
-    /// Returns whether this repacker is currently available on the host (e.g., external binary exists).
+    /// Returns `true` if this repacker is currently available on the host system.
+    ///
+    /// Built-in pure-Rust repackers always return `true`, whereas external command repackers
+    /// check whether their required executable exists in `PATH`.
     fn is_available(&self) -> bool {
         true
     }
 
-    /// Repack the contents of `extracted_dir` into a new serialized byte buffer.
+    /// Repacks the contents of `extracted_dir` into a serialized byte vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading `extracted_dir` or encoding the container format fails.
     fn repack(&self, extracted_dir: &Path, entry: &CarvedEntry) -> Result<Vec<u8>>;
 
-    /// Repack with access to the underlying `BinaryStore` (used by delta-aware repackers like `ZipRepacker`).
+    /// Repacks the contents of `extracted_dir` with access to the underlying [`BinaryStore`].
+    ///
+    /// Delta-aware repackers (such as [`crate::repackers::ZipRepacker`]) override this method
+    /// to inspect the original carved slice in `store` and preserve unmodified entries verbatim.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading `extracted_dir`, reading from `store`, or encoding fails.
     fn repack_with_store(
         &self,
         extracted_dir: &Path,
@@ -33,19 +54,33 @@ pub trait RegionRepacker: Send + Sync {
     }
 }
 
-/// Registry of `RegionRepacker` implementations for write-back from `/extracted/`.
+/// Thread-safe registry mapping Binwalk signature names to [`RegionRepacker`] implementations.
+///
+/// # Examples
+///
+/// ```
+/// use fuse_binwalk::RepackerRegistry;
+/// use fuse_binwalk::repackers::register_builtin_repackers;
+///
+/// let registry = RepackerRegistry::new();
+/// register_builtin_repackers(&registry);
+/// assert!(registry.can_repack("zip"));
+/// assert!(registry.can_repack("gzip"));
+/// ```
 #[derive(Default)]
 pub struct RepackerRegistry {
     repackers: RwLock<HashMap<String, Arc<dyn RegionRepacker>>>,
 }
 
 impl RepackerRegistry {
+    /// Creates an empty [`RepackerRegistry`].
     pub fn new() -> Self {
         Self {
             repackers: RwLock::new(HashMap::new()),
         }
     }
 
+    /// Registers a [`RegionRepacker`] under its [`RegionRepacker::signature_name`].
     pub fn register(&self, repacker: Arc<dyn RegionRepacker>) {
         self.repackers
             .write()
@@ -53,6 +88,10 @@ impl RepackerRegistry {
             .insert(repacker.signature_name().to_string(), repacker);
     }
 
+    /// Looks up an available [`RegionRepacker`] for `signature_name`.
+    ///
+    /// Returns [`None`] if no repacker is registered for `signature_name` or if
+    /// [`RegionRepacker::is_available`] returns `false`.
     pub fn get(&self, signature_name: &str) -> Option<Arc<dyn RegionRepacker>> {
         self.repackers
             .read()
@@ -62,24 +101,26 @@ impl RepackerRegistry {
             .filter(|r| r.is_available())
     }
 
+    /// Returns `true` if an available [`RegionRepacker`] is registered for `signature_name`.
     pub fn can_repack(&self, signature_name: &str) -> bool {
         self.get(signature_name).is_some()
     }
 }
 
+/// Metadata describing the state of a lazily extracted [`CarvedEntry`].
 #[derive(Debug, Clone)]
 pub struct ExtractionRecord {
-    /// Directory on the host filesystem holding the extracted files (or `_extraction_status.txt`).
+    /// Host filesystem directory containing the extracted files (or `_extraction_status.txt`).
     pub output_dir: PathBuf,
-    /// Whether the Binwalk extractor succeeded.
+    /// Whether the Binwalk extractor succeeded and produced output.
     pub success: bool,
-    /// Name of the extractor utility that ran.
+    /// Name or description of the extractor utility that ran.
     pub extractor_name: String,
-    /// Tracks whether any files inside `output_dir` have been modified since extraction.
+    /// Whether any files inside `output_dir` have been modified since extraction.
     pub dirty: bool,
 }
 
-/// Manages lazy on-demand extraction into a temporary workspace and supports repacking.
+/// Manages lazy on-demand extraction into a temporary workspace and coordinates container repacking.
 pub struct ExtractionManager {
     temp_dir: TempDir,
     records: Mutex<HashMap<usize, ExtractionRecord>>,
@@ -87,10 +128,14 @@ pub struct ExtractionManager {
 }
 
 impl ExtractionManager {
+    /// Creates a new [`ExtractionManager`] backed by a temporary directory and pre-populated
+    /// with all built-in [`RegionRepacker`] implementations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the temporary workspace directory cannot be created.
     pub fn new() -> Result<Self> {
-        let temp_dir = tempfile::Builder::new()
-            .prefix("fuse-binwalk-")
-            .tempdir()?;
+        let temp_dir = tempfile::Builder::new().prefix("fuse-binwalk-").tempdir()?;
         let repackers = RepackerRegistry::new();
         crate::repackers::register_builtin_repackers(&repackers);
         Ok(Self {
@@ -100,11 +145,12 @@ impl ExtractionManager {
         })
     }
 
+    /// Returns a reference to the underlying [`RepackerRegistry`].
     pub fn repackers(&self) -> &RepackerRegistry {
         &self.repackers
     }
 
-    /// Checks if an entry has already been extracted without triggering extraction.
+    /// Returns the cached [`ExtractionRecord`] for `entry_index` without triggering extraction.
     pub fn get_cached(&self, entry_index: usize) -> Option<ExtractionRecord> {
         self.records
             .lock()
@@ -113,7 +159,7 @@ impl ExtractionManager {
             .cloned()
     }
 
-    /// Marks an extracted tree as dirty (used when files under `/extracted/<entry>/` are modified).
+    /// Marks the cached extraction tree for `entry_index` as modified.
     pub fn mark_dirty(&self, entry_index: usize) {
         if let Some(rec) = self
             .records
@@ -126,14 +172,19 @@ impl ExtractionManager {
     }
 
     /// Invalidates cached extractions whose spans overlap `modified_span` (excluding `except_entry_idx`).
-    /// Returns the list of invalidated `entry_index` values so the filesystem can refresh its inode cache.
+    ///
+    /// Returns the `entry_index` values that were evicted so the caller can clear corresponding
+    /// virtual inode mappings.
     pub fn invalidate_overlapping(
         &self,
         modified_span: ByteSpan,
         entries: &[CarvedEntry],
         except_entry_idx: Option<usize>,
     ) -> Vec<usize> {
-        let mut guard = self.records.lock().expect("extraction records lock poisoned");
+        let mut guard = self
+            .records
+            .lock()
+            .expect("extraction records lock poisoned");
         let mut invalidated = Vec::new();
         for entry in entries {
             if Some(entry.index) == except_entry_idx {
@@ -149,24 +200,35 @@ impl ExtractionManager {
         invalidated
     }
 
-    /// Lazily extracts `entry` strictly from `[entry.span.start .. entry.span.end]` on first access.
-    /// If extraction fails, populates the directory with `_extraction_status.txt` explaining why.
+    /// Lazily extracts `entry` strictly from `[entry.span.start .. entry.span.end)` on first access.
+    ///
+    /// If extraction fails or produces no files, populates the output directory with an
+    /// `_extraction_status.txt` diagnostic file explaining the failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading `entry.span` from `store` or creating the working directory fails.
     pub fn ensure_extracted(
         &self,
         entry: &CarvedEntry,
         store: &dyn BinaryStore,
     ) -> Result<ExtractionRecord> {
         {
-            let guard = self.records.lock().expect("extraction records lock poisoned");
+            let guard = self
+                .records
+                .lock()
+                .expect("extraction records lock poisoned");
             if let Some(existing) = guard.get(&entry.index) {
                 return Ok(existing.clone());
             }
         }
 
-        // Perform extraction strictly bounded to entry.span
         let record = self.run_bounded_extraction(entry, store)?;
 
-        let mut guard = self.records.lock().expect("extraction records lock poisoned");
+        let mut guard = self
+            .records
+            .lock()
+            .expect("extraction records lock poisoned");
         let final_rec = guard
             .entry(entry.index)
             .or_insert_with(|| record.clone())
@@ -179,7 +241,10 @@ impl ExtractionManager {
         entry: &CarvedEntry,
         store: &dyn BinaryStore,
     ) -> Result<ExtractionRecord> {
-        let work_dir = self.temp_dir.path().join(format!("entry_{:04}", entry.index));
+        let work_dir = self
+            .temp_dir
+            .path()
+            .join(format!("entry_{:04}", entry.index));
         fs::create_dir_all(&work_dir)?;
 
         let slice_bytes = store
@@ -211,7 +276,6 @@ impl ExtractionManager {
             &entry.extractor,
         );
 
-        // Clean up the temporary input slice file to save space
         let _ = fs::remove_file(&slice_file_path);
 
         let output_dir = if result.output_directory.is_empty() {
@@ -228,7 +292,6 @@ impl ExtractionManager {
                 dirty: false,
             })
         } else {
-            // Ensure directory exists and write `_extraction_status.txt` detailing the failure
             fs::create_dir_all(&output_dir)?;
             let status_path = output_dir.join("_extraction_status.txt");
             let status_text = format!(
@@ -256,8 +319,13 @@ impl ExtractionManager {
         }
     }
 
-    /// Repacks a modified `/extracted/<entry>/` directory and writes the new bytes back into
-    /// `entry.span` in `store` (respecting `store.write_policy()`).
+    /// Repacks a modified `/extracted/<entry>/` directory and writes the new bytes into
+    /// `entry.span` in `store` with smart signature padding enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `store` is read-only, if no [`RegionRepacker`] is available for
+    /// `entry`, or if the repacked payload exceeds `entry.span.len()`.
     pub fn repack_entry_into_store(
         &self,
         entry: &CarvedEntry,
@@ -266,8 +334,13 @@ impl ExtractionManager {
         self.repack_entry_with_padding(entry, store, true)
     }
 
-    /// Repacks a modified `/extracted/<entry>/` directory and writes the new bytes back into
-    /// `entry.span` in `store`, using smart signature padding as a fallback when `use_smart_pad` is true.
+    /// Repacks a modified `/extracted/<entry>/` directory and writes the new bytes into
+    /// `entry.span` in `store`, using [`smart_pad_byte`] as a fallback when `use_smart_pad` is `true`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `store` is read-only, if no [`RegionRepacker`] is available for
+    /// `entry`, or if replacing `entry.span` fails.
     pub fn repack_entry_with_padding(
         &self,
         entry: &CarvedEntry,
