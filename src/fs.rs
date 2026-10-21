@@ -130,6 +130,8 @@ pub struct BinwalkFs {
     raw_write_buffers: HashMap<usize, Vec<u8>>,
     /// Tracks the active unpadded payload size (`<= span.len()`) for entries modified during the session.
     modified_payload_sizes: HashMap<usize, usize>,
+    /// Tracks the most recent modification time for `/raw/<entry>` slices modified during the session.
+    raw_mtimes: HashMap<usize, SystemTime>,
     /// When `true`, underflow replacements are rejected with `EINVAL` unless an explicit `pad_byte`
     /// is configured in [`WritePolicy`]. When `false` (default), smart signature padding is used.
     strict_size: bool,
@@ -165,6 +167,7 @@ impl BinwalkFs {
             host_path_to_ino: HashMap::new(),
             raw_write_buffers: HashMap::new(),
             modified_payload_sizes: HashMap::new(),
+            raw_mtimes: HashMap::new(),
             strict_size: false,
             next_ino: FIRST_DYNAMIC_INO,
             mount_time,
@@ -521,6 +524,7 @@ impl BinwalkFs {
 
     /// Invalidates overlapping `/extracted/` caches and updates parent ZIP CRC32 headers after a `/raw/` edit.
     fn on_raw_span_modified(&mut self, entry_idx: usize) {
+        self.raw_mtimes.insert(entry_idx, SystemTime::now());
         let span = self.entries[entry_idx].span;
         let invalidated = self
             .extractor
@@ -651,13 +655,18 @@ impl BinwalkFs {
                 } else {
                     self.entries[*entry_idx].span.len() as u64
                 };
-                Ok(self.make_attr(
+                let mut attr = self.make_attr(
                     ino,
                     FileType::RegularFile,
                     size,
                     self.default_file_perm(writable),
                     1,
-                ))
+                );
+                if let Some(&mtime) = self.raw_mtimes.get(entry_idx) {
+                    attr.mtime = mtime;
+                    attr.ctime = mtime;
+                }
+                Ok(attr)
             }
             InodeKind::RawScratchFile { data, perm } => {
                 Ok(self.make_attr(ino, FileType::RegularFile, data.len() as u64, *perm, 1))
@@ -698,7 +707,15 @@ impl BinwalkFs {
                     }
                 };
                 let nlink = md.nlink().max(1) as u32;
-                Ok(self.make_attr(ino, ft, size, perm, nlink))
+                let mut attr = self.make_attr(ino, ft, size, perm, nlink);
+                if let Ok(mtime) = md.modified() {
+                    attr.mtime = mtime;
+                    attr.ctime = mtime;
+                }
+                if let Ok(atime) = md.accessed() {
+                    attr.atime = atime;
+                }
+                Ok(attr)
             }
         }
     }
@@ -1319,22 +1336,33 @@ impl BinwalkFs {
                         match dst_kind {
                             InodeKind::RawSlice { entry_idx } => {
                                 // Atomic save onto a carved `/raw/<entry>` target!
+                                // Promote `src_ino` to `RawSlice { entry_idx }` and bind `newname`
+                                // to `src_ino` so open descriptors persisted by atomic-save editors
+                                // (e.g. `NamedTempFile::persist`) retain a valid inode matching `newname`.
                                 self.raw_write_buffers.remove(&entry_idx);
                                 self.apply_raw_slice_replacement(entry_idx, &data)?;
+                                if let Some(src_node) = self.inodes.get_mut(&src_ino) {
+                                    src_node.name = newname.to_string();
+                                    src_node.kind = InodeKind::RawSlice { entry_idx };
+                                }
                                 if let Some(raw_dir) = self.inodes.get_mut(&RAW_DIR_INO) {
                                     raw_dir.children.remove(name);
+                                    raw_dir.children.insert(newname.to_string(), src_ino);
                                 }
-                                self.inodes.remove(&src_ino);
                                 return Ok(());
                             }
                             InodeKind::RawScratchFile { .. } => {
-                                if let Some(dst_node) = self.inodes.get_mut(&dst_ino) {
-                                    dst_node.kind = InodeKind::RawScratchFile { data, perm };
+                                if let Some(src_node) = self.inodes.get_mut(&src_ino) {
+                                    src_node.name = newname.to_string();
+                                    src_node.kind = InodeKind::RawScratchFile { data, perm };
                                 }
                                 if let Some(raw_dir) = self.inodes.get_mut(&RAW_DIR_INO) {
                                     raw_dir.children.remove(name);
+                                    raw_dir.children.insert(newname.to_string(), src_ino);
                                 }
-                                self.inodes.remove(&src_ino);
+                                if dst_ino != src_ino {
+                                    self.inodes.remove(&dst_ino);
+                                }
                                 return Ok(());
                             }
                             _ => return Err(libc::EACCES),
@@ -1404,11 +1432,42 @@ impl BinwalkFs {
 
         fs::rename(&src_path, &dst_path).map_err(|_| libc::EIO)?;
 
-        // Refresh inode mappings for the extracted entry
-        self.clear_extracted_inodes_for_entry(src_entry_idx);
-        let _ = self.ensure_directory_populated(parent);
+        // Preserve `src_ino` (and any descendant inodes if renaming a directory) across the rename
+        // so open file descriptors persisted by atomic-save editors keep their inode identity.
+        if let Some(old_dst_ino) = self.host_path_to_ino.remove(&dst_path) {
+            if Some(old_dst_ino) != self.host_path_to_ino.get(&src_path).copied() {
+                self.inodes.remove(&old_dst_ino);
+            }
+        }
+        let remapped: Vec<(PathBuf, u64)> = self
+            .host_path_to_ino
+            .iter()
+            .filter(|(p, _)| p.as_path() == src_path.as_path() || p.starts_with(&src_path))
+            .map(|(p, &ino)| (p.clone(), ino))
+            .collect();
+        for (old_p, ino) in remapped {
+            self.host_path_to_ino.remove(&old_p);
+            let new_p = if old_p == src_path {
+                dst_path.clone()
+            } else if let Ok(rel) = old_p.strip_prefix(&src_path) {
+                dst_path.join(rel)
+            } else {
+                dst_path.clone()
+            };
+            self.host_path_to_ino.insert(new_p.clone(), ino);
+            if let Some(node) = self.inodes.get_mut(&ino) {
+                if old_p == src_path {
+                    node.parent = newparent;
+                    node.name = newname.to_string();
+                }
+                if let InodeKind::ExtractedHostNode { host_path, .. } = &mut node.kind {
+                    *host_path = new_p;
+                }
+            }
+        }
+        let _ = self.sync_host_directory_children(parent, src_entry_idx, &src_host_dir);
         if newparent != parent {
-            let _ = self.ensure_directory_populated(newparent);
+            let _ = self.sync_host_directory_children(newparent, dst_entry_idx, &dst_host_dir);
         }
 
         self.extractor.mark_dirty(src_entry_idx);

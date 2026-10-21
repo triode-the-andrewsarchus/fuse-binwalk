@@ -50,3 +50,65 @@ pub use scanner::{
 pub use storage::{
     smart_pad_byte, BinaryStore, ByteSpan, OverlayBinaryStore, StorageError, WritePolicy,
 };
+
+/// Scans `binary_path`, daemonizes the current process, and serves a [`BinwalkFs`] mount at
+/// `mount_point` until unmounted or terminated.
+///
+/// # Errors
+///
+/// Returns an error if reading `binary_path`, scanning signatures, initializing [`BinwalkFs`],
+/// daemonizing, or mounting the FUSE filesystem fails.
+pub fn run_mount_daemon(
+    binary_path: &std::path::Path,
+    mount_point: &std::path::Path,
+    writable: bool,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let policy = if writable {
+        WritePolicy::InPlaceBounded {
+            pad_byte: None,
+            write_through: true,
+        }
+    } else {
+        WritePolicy::ReadOnly
+    };
+
+    let store = std::sync::Arc::new(
+        OverlayBinaryStore::from_file(binary_path, policy)
+            .with_context(|| format!("Failed to open '{}'", binary_path.display()))?,
+    );
+
+    let scan_config = ScanConfig::default();
+    let entries = scan_bounded_signatures(store.base_bytes(), &scan_config)
+        .context("Failed to scan signatures")?;
+
+    let fs = BinwalkFs::new(store, entries).context("Failed to initialize BinwalkFs")?;
+
+    let options = vec![
+        if writable {
+            fuser::MountOption::RW
+        } else {
+            fuser::MountOption::RO
+        },
+        fuser::MountOption::FSName("fuse-binwalk".to_string()),
+        fuser::MountOption::Subtype("binwalk".to_string()),
+    ];
+
+    let daemonize = daemonize::Daemonize::new().working_directory("/");
+    daemonize
+        .start()
+        .context("Failed to daemonize fuse-binwalk process")?;
+
+    let session = fuser::spawn_mount2(fs, mount_point, &options)
+        .with_context(|| format!("Failed to spawn FUSE mount at '{}'", mount_point.display()))?;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = ctrlc::set_handler(move || {
+        let _ = tx.send(());
+    });
+
+    let _ = rx.recv();
+    drop(session);
+    Ok(())
+}

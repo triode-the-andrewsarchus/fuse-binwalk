@@ -404,10 +404,17 @@ fn test_raw_smart_padding_atomic_rename_and_zip_crc32_sync() {
     )
     .unwrap();
 
-    // Verify smart padding (`0x20` ASCII space for SVG) filled the remainder of the SVG span
+    // Verify smart padding (`0x20` ASCII space for SVG) filled the remainder of the SVG span,
+    // and that open handles to `scratch_attr.ino` (e.g. `NamedTempFile::persist`) remain valid
+    // and match the renamed target inode.
+    let persisted_attr = fs
+        .compute_attr(scratch_attr.ino)
+        .expect("Persisted scratch inode should remain valid after atomic rename");
     let svg_attr = fs
         .lookup_node(RAW_DIR_INO, &svg_entry.raw_filename)
         .unwrap();
+    assert_eq!(persisted_attr.ino, svg_attr.ino);
+    assert_eq!(persisted_attr.size, svg_attr.size);
     let updated_svg_slice = fs.read_node(svg_attr.ino, 0, svg_attr.size as u32).unwrap();
     assert_eq!(updated_svg_slice.len(), svg_entry.span.len());
     assert_eq!(&updated_svg_slice[..shorter_svg.len()], shorter_svg);
